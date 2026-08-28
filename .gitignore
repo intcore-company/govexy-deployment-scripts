@@ -1,0 +1,12 @@
+# Per-node overrides and anything carrying credentials never belong here.
+# govexy-node.conf IS tracked: it holds infrastructure addresses and tuning that
+# both nodes must share, and a value diverging between nodes is exactly the
+# failure this repository exists to make visible. Secrets live in the
+# application's .env, which is not managed from here.
+*.local
+*.local.conf
+.env
+.env.*
+*.pem
+*.key
+*.log
