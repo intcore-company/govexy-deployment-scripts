@@ -162,7 +162,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "1/9  Pre-flight"
+log "1/10 Pre-flight"
 # ═════════════════════════════════════════════════════════════════════════════
 
 $DRY_RUN && log "DRY RUN — nothing will be changed"
@@ -222,17 +222,7 @@ if ! $DRY_RUN; then
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "2/9  Maintenance mode"
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Node-local: storage/framework/maintenance.php is not on the share, so each
-# node goes dark only for itself. With a load balancer in front, take nodes one
-# at a time and the site stays up.
-as_app "php '$APP_ROOT/artisan' down --render='errors::503' --retry=60 || true"
-MAINT_ON=true
-
-# ═════════════════════════════════════════════════════════════════════════════
-log "3/9  Source code"
+log "2/10 Source code"
 # ═════════════════════════════════════════════════════════════════════════════
 
 if $DO_PULL; then
@@ -299,7 +289,7 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "4/9  PHP dependencies"
+log "3/10 PHP dependencies"
 # ═════════════════════════════════════════════════════════════════════════════
 
 if $DO_COMPOSER; then
@@ -317,7 +307,7 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "5/9  Front-end assets"
+log "4/10 Front-end assets"
 # ═════════════════════════════════════════════════════════════════════════════
 
 if $DO_BUILD; then
@@ -343,7 +333,7 @@ fi
   warn "public/build is missing — the panels will throw a Vite manifest exception"
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "5b/9  Test suite"
+log "5/10 Test suite"
 # ═════════════════════════════════════════════════════════════════════════════
 
 if $DO_TESTS; then
@@ -514,7 +504,36 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "6/9  Database"
+# ORDER: maintenance mode starts AFTER the test gate, deliberately.
+#
+# It used to start at step 2, which left storage/framework/maintenance.php on
+# disk for the whole test run — so PreventRequestsDuringMaintenance answered
+# every HTTP feature test with 503, and the gate reported hundreds of failures
+# that were one operational state rather than one bug each.
+#
+# Downtime is now the migrations, caches and reload — about two minutes — rather
+# than that plus the ten the suite takes.
+#
+# The trade-off, stated plainly: from the composer step until here, the node
+# serves requests with the new vendor/ tree while opcache still holds the old
+# bytecode. Laravel autoloads lazily, so a request touching a class not yet
+# cached reads the new file. That window is the test duration. Take the node out
+# of the load balancer first, or deploy with --skip-tests, if a given release
+# cannot tolerate it.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════════════════
+log "6/10 Maintenance mode"
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Node-local: storage/framework/maintenance.php is not on the share, so each
+# node goes dark only for itself. With a load balancer in front, take nodes one
+# at a time and the site stays up.
+as_app "php '$APP_ROOT/artisan' down --render='errors::503' --retry=60 || true"
+MAINT_ON=true
+
+# ═════════════════════════════════════════════════════════════════════════════
+log "7/10 Database"
 # ═════════════════════════════════════════════════════════════════════════════
 
 if $PRIMARY; then
@@ -534,7 +553,7 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "7/9  Ownership, SELinux, storage link"
+log "8/10 Ownership, SELinux, storage link"
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Sweep the whole tree so nothing composer, npm or git left behind is misowned —
@@ -555,7 +574,7 @@ if [[ ! -L "$APP_ROOT/public/storage" ]]; then
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "8/9  Caches"
+log "9/10 Caches"
 # ═════════════════════════════════════════════════════════════════════════════
 
 # The only place caches are built. Everything before this point runs uncached on
@@ -586,7 +605,7 @@ ok "events cached"
 reown
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "9/9  Restart services"
+log "10/10 Restart services"
 # ═════════════════════════════════════════════════════════════════════════════
 
 # opcache.validate_timestamps=0 — without this reload the new code is invisible.
