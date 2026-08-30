@@ -98,13 +98,10 @@ if [[ -z "$LB_IPS" && "$RESTRICT_HTTP_TO_LB" == "yes" ]]; then
   die "RESTRICT_HTTP_TO_LB=yes requires LB_IPS. Set one or the other."
 fi
 
-PHP_POST_MAX="${PHP_POST_MAX:-${PHP_UPLOAD_MAX}}"
-PHP_CLI_MEMORY_LIMIT="${PHP_CLI_MEMORY_LIMIT:-1024M}"
-
-# post_max_size MUST exceed upload_max_filesize, and the whole point of them
-# being two keys is that someone can get that backwards. Normalise the K/M/G
-# suffix to bytes and assert it, rather than writing a pool that silently
-# returns 419 on every upload at the limit.
+# to_bytes is defined BEFORE it is used to derive the default below.
+#
+# 10#$n forces base 10: a conf carrying "0128M" would otherwise be read as octal
+# by $(( )) and silently become 88M.
 to_bytes() {
   # tr rather than ${v^^}: that is a bash 4 feature and this has to keep working
   # if the file is ever run under an older shell.
@@ -113,12 +110,27 @@ to_bytes() {
   n="${v%[KMG]}"
   [[ "$n" =~ ^[0-9]+$ ]] || { printf '0'; return; }
   case "$v" in
-    *G) printf '%s' $(( n * 1024 * 1024 * 1024 )) ;;
-    *M) printf '%s' $(( n * 1024 * 1024 )) ;;
-    *K) printf '%s' $(( n * 1024 )) ;;
-    *)  printf '%s' "$n" ;;
+    *G) printf '%s' $(( 10#$n * 1024 * 1024 * 1024 )) ;;
+    *M) printf '%s' $(( 10#$n * 1024 * 1024 )) ;;
+    *K) printf '%s' $(( 10#$n * 1024 )) ;;
+    *)  printf '%s' $(( 10#$n )) ;;
   esac
 }
+
+# post_max_size MUST exceed upload_max_filesize, and the assertion below is
+# strict — so the default cannot be PHP_UPLOAD_MAX itself. It was, which meant
+# every conf written before PHP_POST_MAX existed hard-failed stage 2 on an
+# upgrade. Derive a working value instead: the file plus 8M of multipart
+# overhead, which is far more than boundaries, field names and a CSRF token need.
+if [[ -z "${PHP_POST_MAX:-}" ]]; then
+  _u=$(to_bytes "$PHP_UPLOAD_MAX")
+  if (( _u > 0 )); then
+    PHP_POST_MAX="$(( _u / 1024 / 1024 + 8 ))M"
+  else
+    PHP_POST_MAX="$PHP_UPLOAD_MAX"
+  fi
+fi
+PHP_CLI_MEMORY_LIMIT="${PHP_CLI_MEMORY_LIMIT:-1024M}"
 
 _upload_b=$(to_bytes "$PHP_UPLOAD_MAX")
 _post_b=$(to_bytes "$PHP_POST_MAX")
@@ -132,7 +144,8 @@ _post_b=$(to_bytes "$PHP_POST_MAX")
        it once boundaries, field names and the CSRF token are counted. PHP then
        discards the whole body and raises nothing: \$_POST and \$_FILES arrive
        empty, Laravel sees no CSRF token and returns 419 — which reads as a
-       session problem, not a size one. Allow at least 32M of headroom."
+       session problem, not a size one. Allow at least 8M of headroom."
+
 SECURITY_HEADERS="${SECURITY_HEADERS:-yes}"
 HSTS_MAX_AGE="${HSTS_MAX_AGE:-31536000}"
 HSTS_INCLUDE_SUBDOMAINS="${HSTS_INCLUDE_SUBDOMAINS:-yes}"

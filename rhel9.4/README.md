@@ -304,13 +304,20 @@ grep -E '^(APP_ENV|APP_DEBUG|TELESCOPE_ENABLED|LICENSE_MODE)=' /var/www/govexy/.
 | `TELESCOPE_ENABLED` | `false` | **Most likely to be missing.** `config/telescope.php` defaults it to `true`, and `laravel/telescope` is in `require`, so `--no-dev` leaves it installed. The UI is gated but the *recording* is not: every request, query, job and payload is written to `telescope_entries`, unbounded, on government data. It is absent from older `.env` files, so add it. |
 | `LICENSE_MODE` | present (`onprem`) | `onprem` and `saas` are different products. |
 
-Two other changes affect an existing estate:
+Three other changes affect an existing estate:
+
+- **`PHP_POST_MAX`** is new in `govexy-node.conf`. A conf written before it existed still
+  works — stage 2 derives `PHP_UPLOAD_MAX + 8M` — but set it explicitly if you want a
+  different ceiling. It must be strictly greater than `PHP_UPLOAD_MAX`, and stage 2 now
+  refuses to run if it is not.
 
 - **`NODE_ROLE`** is new in `govexy-node.conf` and defaults to `secondary`. Set it to
   `primary` on the one node that runs migrations and the scheduler, or
   `05-configure-workers.sh --scheduler` will refuse.
 - **`--ref` is now required** for a deploy that pulls. There is no "deploy whatever is on
   the branch" path any more.
+- **`--primary` must agree with `NODE_ROLE`.** `04-deploy.sh` refuses a run where one says
+  primary and the other does not, in either direction.
 
 ---
 

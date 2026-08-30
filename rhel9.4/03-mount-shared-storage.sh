@@ -200,6 +200,11 @@ log "4/7  Pre-flight — protect content that a bind mount would hide"
 # is usually only Laravel's .gitignore stub; for resources/themes it is real,
 # tracked content.
 
+# Declared BEFORE the loop that sets it. It was initialised after, in the fstab
+# section, so a partial seed set it and the next statement immediately reset it
+# to 0 — the warning at the end could never fire.
+SEED_INCOMPLETE=0
+
 for m in "${MAPPINGS[@]}"; do
   IFS='|' read -r src tgt label <<< "$m"
 
@@ -269,8 +274,6 @@ done
 # ═════════════════════════════════════════════════════════════════════════════
 log "5/7  Write fstab entries"
 # ═════════════════════════════════════════════════════════════════════════════
-
-SEED_INCOMPLETE=0
 
 FSTAB_ADDED=0
 

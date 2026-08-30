@@ -739,12 +739,32 @@ To recover by hand:
 
 ```bash
 mount -a
-systemctl reset-failed govexy-horizon
 systemctl start govexy-horizon
 ```
 
-`reset-failed` is the part people miss: without it `start` on a unit in the
-failed state is refused.
+`reset-failed` is only needed if the unit is genuinely in the `failed` state —
+which here means it hit the start rate limit, not that a dependency was missing.
+An unsatisfied `RequiresMountsFor=` leaves the unit **inactive**, and `start`
+works on it directly once the mounts are there. Check before reaching for it:
+
+```bash
+systemctl is-failed govexy-horizon     # "failed" -> reset-failed first
+systemctl reset-failed govexy-horizon
+```
+
+**Stopping the timer from restarting Horizon**
+
+The timer exists to fight an accidental stop, so it will also fight a deliberate
+one — draining a node, or holding the queue while you debug a poison job. Two
+ways to tell it not to:
+
+```bash
+touch /run/govexy-horizon.hold     # this boot only; /run is cleared on reboot
+systemctl disable govexy-horizon   # permanent, survives reboot
+```
+
+The timer skips when either is true, so `systemctl stop govexy-horizon` alone is
+not enough — it will be restarted within the minute.
 
 **`resources/themes` is still tracked in git**
 

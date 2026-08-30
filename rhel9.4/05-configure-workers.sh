@@ -474,6 +474,16 @@ EOF
 #
 # A .path unit is the more obvious tool and the wrong one here: PathExists=
 # entries are OR-ed, and what has to be true is the AND of all three.
+#
+# Two escape hatches, because "starts Horizon whenever it is not running" would
+# otherwise fight an operator who stopped it on purpose — draining a node,
+# debugging a poison job — and win, once a minute:
+#
+#   systemctl disable govexy-horizon      permanent: is-enabled gates the timer
+#   touch /run/govexy-horizon.hold        for this boot only; clears on reboot
+#
+# --no-block so a Horizon that is slow to start does not hold the timer's own
+# start job open and trip TimeoutStartSec on the wrapper rather than on Horizon.
 cat > "$MOUNTWAIT_SERVICE" <<EOF
 [Unit]
 Description=Start GovExy Horizon once the shared mounts are present
@@ -481,7 +491,7 @@ Documentation=man:systemd.mount(5)
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'for m in ${APP_ROOT}/storage/app/public ${APP_ROOT}/storage/app/private ${APP_ROOT}/resources/themes; do findmnt -rn "\$m" >/dev/null 2>&1 || exit 0; done; systemctl is-active --quiet govexy-horizon && exit 0; systemctl reset-failed govexy-horizon 2>/dev/null || true; exec systemctl start govexy-horizon'
+ExecStart=/bin/bash -c 'test -e /run/govexy-horizon.hold && exit 0; systemctl is-enabled --quiet govexy-horizon || exit 0; for m in ${APP_ROOT}/storage/app/public ${APP_ROOT}/storage/app/private ${APP_ROOT}/resources/themes; do findmnt -rn "\$m" >/dev/null 2>&1 || exit 0; done; systemctl is-active --quiet govexy-horizon && exit 0; systemctl reset-failed govexy-horizon 2>/dev/null || true; exec systemctl start --no-block govexy-horizon'
 EOF
 
 cat > "$MOUNTWAIT_TIMER" <<'EOF'
@@ -500,9 +510,12 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now govexy-horizon-mountwait.timer
-ok "mount-wait timer installed (recovers Horizon after an NFS outage at boot)"
 
+# Horizon FIRST, then the timer — and the timer only once Horizon is confirmed
+# up. Enabling the recovery timer before knowing Horizon can start at all means
+# a genuinely broken unit (bad .env, no Redis) gets restarted every 60 seconds
+# forever, filling the journal and hiding the original failure behind a wall of
+# identical start attempts.
 systemctl enable --now govexy-horizon
 sleep 3
 systemctl is-active --quiet govexy-horizon \
@@ -514,7 +527,13 @@ systemctl is-active --quiet govexy-horizon \
            findmnt ${APP_ROOT}/storage/app/public
            findmnt ${APP_ROOT}/storage/app/private
            findmnt ${APP_ROOT}/resources/themes
-       govexy-horizon-mountwait.timer starts it automatically once they are."
+
+       The mount-wait timer is NOT installed while Horizon cannot start, so it
+       is not masking anything here. Re-run this stage once the unit is healthy."
+
+systemctl enable --now govexy-horizon-mountwait.timer
+ok "mount-wait timer installed (recovers Horizon after an NFS outage at boot)"
+ok "    to stop it restarting Horizon: touch /run/govexy-horizon.hold"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
