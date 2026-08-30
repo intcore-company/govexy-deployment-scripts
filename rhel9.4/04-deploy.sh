@@ -89,7 +89,10 @@ while [[ $# -gt 0 ]]; do
     --skip-composer) DO_COMPOSER=false ;;
     --with-tests)    DO_TESTS=true;  TESTS_EXPLICIT=true ;;
     --skip-tests)    DO_TESTS=false; TESTS_EXPLICIT=true ;;
-    --tests-advisory) TESTS_ADVISORY=true ;;
+    # Implies --with-tests. Asking for failures to be advisory while the conf
+    # has DO_TESTS=false produced a run with no suite and no warning, which is
+    # the opposite of what the flag asks for.
+    --tests-advisory) TESTS_ADVISORY=true; DO_TESTS=true; TESTS_EXPLICIT=true ;;
     --dry-run)       DRY_RUN=true ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; exit 1 ;;
   esac
@@ -114,9 +117,12 @@ run() {
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT="/var/www/govexy"
+# || true on every conf read: grep exits 1 when the key is absent, and under a
+# pipeline with set -o pipefail that failure propagates out of the command
+# substitution and kills the script over a missing optional setting.
 [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
   APP_ROOT=$(grep -E '^APP_ROOT=' "${SCRIPT_DIR}/govexy-node.conf" | head -1 \
-             | cut -d= -f2- | tr -d '"' | awk '{print $1}')
+             | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
 APP_ROOT="${APP_ROOT:-/var/www/govexy}"
 
 # A DO_TESTS setting in govexy-node.conf becomes the site-wide default; an
@@ -128,7 +134,7 @@ APP_ROOT="${APP_ROOT:-/var/www/govexy}"
 # silent no-op and the release shipped with nothing verified.
 if ! $TESTS_EXPLICIT && [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]]; then
   conf_tests=$(grep -E '^DO_TESTS=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
-               | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}')
+               | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
   [[ "$conf_tests" == "false" ]] && DO_TESTS=false
 fi
 
@@ -145,7 +151,9 @@ APP_GROUP=$(stat -c '%G' "$APP_ROOT")
 # exists, but a failed redirect under set -e would abort the deploy with a bare
 # shell error and no explanation. Degrade to a warning rather than that.
 if ! $DRY_RUN; then
-  if exec 9>/var/lock/govexy-deploy.lock; then
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "flock is not installed (util-linux) — concurrent deploys are not guarded"
+  elif exec 9>/var/lock/govexy-deploy.lock; then
     flock -n 9 || die "another deploy is already running on this node"
   else
     warn "could not open /var/lock/govexy-deploy.lock — concurrent deploys are not guarded"
@@ -191,6 +199,43 @@ as_app_env() {
         npm_config_cache='$NPM_CACHE' $*"
 }
 
+# Records one line in a file on the SHARED export, as the application user.
+#
+# Three things this has to get right, and root-owned `install` + redirect +
+# `chown` got none of them:
+#
+#   - The export is root_squash (NFS-SHARED-STORAGE.md §3), so root's write is
+#     squashed to nobody and fails EACCES — which would abort every deploy on a
+#     correctly configured export. Everything here runs as the app user,
+#     including the REDIRECT, which is why it is inside sh -c: a redirect written
+#     outside it is opened by root's shell before sudo ever runs.
+#   - Truncate-then-write leaves a window in which the other node reads an empty
+#     file and concludes nothing was recorded. Write a temp file beside it and
+#     mv, which is atomic within one directory.
+#   - A marker is a cross-check, not the release. Losing it must not fail a
+#     deploy that is otherwise fine, so a failure warns and says what is now off.
+write_shared_marker() {
+  local path="$1" value="$2" label="$3"
+
+  if $DRY_RUN; then
+    printf '\033[2m[dry-run] would record %s in %s\033[0m\n' "$value" "$path"
+    return 0
+  fi
+
+  if sudo -u "$APP_USER" sh -c '
+        umask 027
+        tmp="$2.tmp.$$"
+        printf "%s\n" "$1" > "$tmp" && mv -f "$tmp" "$2"
+      ' sh "$value" "$path" 2>/dev/null; then
+    ok "recorded ${label}: ${value}"
+  else
+    warn "could not write ${path} as ${APP_USER}."
+    warn "${label} is NOT recorded, so cross-node checking is OFF for this release."
+    warn "Check that ${APP_USER} can write the shared export — root cannot, under"
+    warn "the root_squash that NFS-SHARED-STORAGE.md recommends."
+  fi
+}
+
 # Runs as root with root's SSH identity and known_hosts.
 #
 # -c safe.directory: git refuses to operate on a repository owned by another
@@ -209,35 +254,105 @@ root_git() {
 # Files git just wrote are root-owned. Hand them back before anything runs as
 # the app user.
 reown() {
-  run "find '$APP_ROOT' -xdev \( ! -user '$APP_USER' -o ! -group '$APP_GROUP' \) \
+  # -xdev AND an explicit -prune on the three mount points. -xdev alone is
+  # correct only while they really are separate filesystems: a bind that failed
+  # to mount (nofail makes that survivable) leaves a plain local directory on
+  # the same device, and find walks straight into it. The -prune is what makes
+  # the guarantee independent of whether the mount is up.
+  run "find '$APP_ROOT' -xdev \
+        -path '$APP_ROOT/storage/app/public' -prune -o \
+        -path '$APP_ROOT/storage/app/private' -prune -o \
+        -path '$APP_ROOT/resources/themes' -prune -o \
+        \( ! -user '$APP_USER' -o ! -group '$APP_GROUP' \) \
         -exec chown '$APP_USER':'$APP_GROUP' {} + 2>/dev/null || true"
 }
 
 MAINT_ON=false
+# Set once the checkout has swapped the code tree. From that point the node is
+# carrying the NEW release against the OLD schema, so lifting maintenance is a
+# decision rather than a courtesy.
+CODE_SWAPPED=false
+# Set once migrations have run. Code swapped + migrated is a consistent node;
+# code swapped + not migrated is not.
+MIGRATED=false
 
 # EXIT, not ERR. die() calls exit, and exit does not fire an ERR trap — using
 # ERR here meant any failed pre-flight or pull left the node in maintenance mode
 # with nothing to lift it.
 cleanup() {
   local status=$?
-  if (( status != 0 )) && $MAINT_ON && ! $DRY_RUN; then
-    warn "deploy failed (exit ${status}) — clearing compiled caches and lifting maintenance"
-    # Step 9 builds config, route, view and event caches as four separate gates.
-    # A failure at the second one used to lift maintenance onto a NEW cached
-    # config with NO route cache — a state nothing has ever been tested in.
-    # Clear all four so the node comes back uncached, which is slower and
-    # correct.
-    #
-    # Not optimize:clear. That includes cache:clear, which flushes the Redis
-    # store shared with the other node and with Horizon.
-    for c in config:clear route:clear view:clear event:clear; do
-      sudo -u "$APP_USER" php "$APP_ROOT/artisan" "$c" >/dev/null 2>&1 || true
-    done
-    sudo -u "$APP_USER" php "$APP_ROOT/artisan" up || \
-      warn "could not lift maintenance mode; run: sudo -u $APP_USER php $APP_ROOT/artisan up"
+  (( status == 0 )) && return 0
+  $MAINT_ON || return 0
+  $DRY_RUN && return 0
+
+  # Step 9 builds config, route, view and event caches as four separate gates.
+  # A failure at the second one used to lift maintenance onto a NEW cached
+  # config with NO route cache — a state nothing has ever been tested in.
+  # Clear all four so the node comes back uncached, which is slower and correct.
+  #
+  # Not optimize:clear. That includes cache:clear, which flushes the Redis store
+  # shared with the other node and with Horizon.
+  warn "deploy failed (exit ${status}) — clearing compiled caches"
+  for c in config:clear route:clear view:clear event:clear; do
+    sudo -u "$APP_USER" php "$APP_ROOT/artisan" "$c" >/dev/null 2>&1 || true
+  done
+
+  # Whether to lift maintenance at all is a real decision, and this used to make
+  # it unconditionally.
+  #
+  # Once the checkout has run, the tree is the NEW release. If migrations have
+  # not run yet, `up` puts new code in front of the old schema and serves errors
+  # to real traffic — worse than staying dark, and harder to notice. It also
+  # used to serve with dev dependencies installed, since the gate runs before
+  # they are stripped.
+  if $CODE_SWAPPED && ! $MIGRATED; then
+    warn ""
+    warn "LEAVING THIS NODE IN MAINTENANCE MODE, deliberately."
+    warn ""
+    warn "The working tree is now ${DEPLOY_REF:-the new release} but its migrations"
+    warn "have NOT run. Lifting maintenance would serve new code against the old"
+    warn "schema. This node stays out of the load balancer until you decide."
+    warn ""
+    warn "Either finish the deploy:"
+    # PRIMARY holds the strings "true"/"false", so ${PRIMARY:+...} would always
+    # expand — "false" is not empty. Branch on the value instead.
+    if $PRIMARY; then
+      warn "    bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>} --primary --skip-tests"
+    else
+      warn "    bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>} --skip-tests"
+    fi
+    warn "or roll the tree back to the running release and lift it by hand:"
+    warn "    bash 04-deploy.sh --ref <previous-tag> --skip-tests"
+    warn ""
+    warn "To lift it anyway, knowing the above:"
+    warn "    sudo -u $APP_USER php $APP_ROOT/artisan up"
+    return 0
   fi
+
+  # Safe to come back up. Strip dev dependencies first: the gate installs them,
+  # and a failure between the gate and step 6's cleanup would otherwise leave
+  # Pest, PHPUnit and the factories on a serving node.
+  if $CODE_SWAPPED && $DO_COMPOSER; then
+    warn "removing dev dependencies before lifting maintenance"
+    sudo -u "$APP_USER" env HOME="$APP_HOME" \
+      COMPOSER_HOME="$COMPOSER_CACHE" COMPOSER_CACHE_DIR="$COMPOSER_CACHE/cache" \
+      composer install --working-dir="$APP_ROOT" --no-dev --optimize-autoloader \
+      --no-interaction --prefer-dist >/dev/null 2>&1 || \
+      warn "could not strip dev dependencies — do it by hand before this node serves"
+  fi
+
+  warn "lifting maintenance mode"
+  sudo -u "$APP_USER" php "$APP_ROOT/artisan" up || \
+    warn "could not lift maintenance mode; run: sudo -u $APP_USER php $APP_ROOT/artisan up"
 }
 trap cleanup EXIT
+
+# An interrupted deploy must run cleanup() too. Without these, Ctrl-C kills the
+# script outright and the EXIT trap never fires, which is how a node ends up
+# dark with nobody knowing why.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # ═════════════════════════════════════════════════════════════════════════════
 log "1/10 Pre-flight"
@@ -482,6 +597,7 @@ if $DO_PULL; then
 
   if ! $DRY_RUN; then
     DEPLOYED_SHA=$(git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" rev-parse HEAD)
+    CODE_SWAPPED=true
     ok "deployed ref: ${DEPLOY_REF} (${DEPLOYED_SHA})"
   fi
 
@@ -500,9 +616,7 @@ fi
 # makes unlikely and this makes visible.
 if ! $DRY_RUN && [[ -n "$DEPLOY_REF" ]]; then
   if $PRIMARY; then
-    run "install -o '$APP_USER' -g '$APP_GROUP' -m 0644 /dev/null '$DEPLOYED_REF_FILE'"
-    run "printf '%s\n' '$DEPLOY_REF' > '$DEPLOYED_REF_FILE'"
-    run "chown '$APP_USER':'$APP_GROUP' '$DEPLOYED_REF_FILE'"
+    write_shared_marker "$DEPLOYED_REF_FILE" "$DEPLOY_REF" "deployed ref"
   elif [[ -r "$DEPLOYED_REF_FILE" ]]; then
     primary_ref=$(head -1 "$DEPLOYED_REF_FILE" | awk '{print $1}')
     [[ "$primary_ref" == "$DEPLOY_REF" ]] || \
@@ -523,9 +637,34 @@ fi
 # likelier mistake: running the second node first, or forgetting --primary on
 # both. That node then caches new code against the old schema and throws until
 # someone notices, and the pre-flight banner asked no questions about it.
+#
+# This has to fail CLOSED. The first version was
+#     pending=$(… migrate:status 2>/dev/null | grep -c Pending || true)
+# which reports 0 for every way the command can fail — no database, a fatal
+# booting the framework, migrate:status not existing on the release — and 0 is
+# read here as "the primary has deployed, carry on". The check then passes
+# hardest exactly when the node is least healthy. Capture the output and the
+# exit code, and require the table to look like a migration table.
 if ! $PRIMARY && ! $DRY_RUN; then
-  pending=$(sudo -u "$APP_USER" php "$APP_ROOT/artisan" migrate:status 2>/dev/null \
-            | grep -c 'Pending' || true)
+  set +e
+  migrate_status=$(sudo -u "$APP_USER" php "$APP_ROOT/artisan" migrate:status 2>&1)
+  migrate_rc=$?
+  set -e
+
+  (( migrate_rc == 0 )) || die "migrate:status failed (exit ${migrate_rc}):
+
+$(printf '%s\n' "$migrate_status" | sed 's/^/       /')
+
+       Cannot tell whether the primary has deployed this release. Fix the
+       database connection or the boot failure above before deploying."
+
+  grep -qE 'Ran|Pending' <<<"$migrate_status" || die "migrate:status returned no migration rows:
+
+$(printf '%s\n' "$migrate_status" | sed 's/^/       /')
+
+       Refusing to treat unrecognised output as 'nothing pending'."
+
+  pending=$(grep -c 'Pending' <<<"$migrate_status" || true)
   if (( pending > 0 )); then
     die "${pending} migrations are still pending.
 
@@ -578,7 +717,36 @@ if $DO_TESTS && ! $DRY_RUN; then
        balancer, which is the more expensive of the two failures."
 fi
 
-as_app "php '$APP_ROOT/artisan' down --render='errors::503' --retry=60 || true"
+# A bypass secret, so the node can be smoke-tested through the load balancer
+# path before `up` puts it back in rotation. Printed once, here; it is a URL
+# token, not a credential, and it dies with the maintenance window.
+MAINT_SECRET=$(openssl rand -hex 16 2>/dev/null || true)
+# Fall back on an EMPTY result too, not just a non-zero exit: a secret that is
+# the empty string makes `down --secret=` accept every request as a bypass.
+[[ -n "$MAINT_SECRET" ]] || MAINT_SECRET="deploy-$(date +%s)-$$"
+
+as_app "php '$APP_ROOT/artisan' down --render='errors::503' --retry=60 --secret='$MAINT_SECRET' || true"
+
+# `|| true` above keeps a fatal from aborting the deploy, which is right — but
+# it also used to let MAINT_ON=true stand on a node that never went down. A new
+# tag against an old vendor/ is exactly when `down` fatals, and that is exactly
+# when the node must NOT stay in the load balancer while composer and Vite
+# rewrite it underneath. Verify the flag file rather than the exit code.
+if ! $DRY_RUN; then
+  [[ -f "$APP_ROOT/storage/framework/down" ]] || \
+    die "artisan down did not take effect — this node is STILL IN THE LOAD BALANCER.
+
+       The next steps rewrite vendor/ and empty public/build. Running them now
+       serves 404s for every hashed asset to real traffic.
+
+       Usually a fatal booting the framework: a new tag against the previous
+       release's vendor/. Fix that first:
+           sudo -u $APP_USER php $APP_ROOT/artisan down --render='errors::503'
+       and re-run, or drain this node at the load balancer by hand."
+  ok "maintenance mode active — this node has left the load balancer"
+  printf 'bypass  : http://<this node>/?secret=%s\n' "$MAINT_SECRET"
+fi
+
 MAINT_ON=true
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -659,10 +827,18 @@ if $DO_TESTS; then
     # is enough.
     for v in DB_CONNECTION DB_DATABASE DB_HOST DB_USERNAME DB_PASSWORD APP_ENV \
              FILESYSTEM_DISK CACHE_STORE SESSION_DRIVER QUEUE_CONNECTION; do
-      [[ -z "${!v:-}" ]] || die "$v is set in the deploy environment ('${!v}').
+      # The value is shown for everything except the password, which would end
+      # up in the operator's scrollback and in any log they paste into a ticket.
+      if [[ -n "${!v:-}" ]]; then
+        case "$v" in
+          *PASSWORD*|*SECRET*|*KEY*) shown="(value not shown)" ;;
+          *)                         shown="'${!v}'" ;;
+        esac
+        die "$v is set in the deploy environment ${shown}.
 
        PHPUnit's <env> does not override an inherited variable, so this would
        beat the pins in phpunit.xml. Unset it and re-run."
+      fi
     done
 
     [[ -d "$APP_ROOT/tests" && -f "$APP_ROOT/phpunit.xml" ]] || \
@@ -773,7 +949,13 @@ if $DO_TESTS; then
     #
     # APP_MAINTENANCE_DRIVER=cache is what makes the suite immune to the
     # maintenance mode entered in step 3.
+    # timeout, because this runs INSIDE the maintenance window. A suite that
+    # hangs — a wedged NFS stat, a test waiting on a socket nothing will answer —
+    # used to hold the node dark indefinitely with no ceiling and no signal.
+    # 30 minutes is triple the observed run; TERM first so Pest can print what it
+    # was doing, KILL 60 s later if it will not go.
     set +e
+    timeout --signal=TERM --kill-after=60 1800 \
     sudo -u "$APP_USER" env -i \
       HOME="$APP_HOME" \
       PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin \
@@ -842,11 +1024,32 @@ if $DO_TESTS; then
   elif (( TEST_RC == 0 )); then
     ok "test suite passed in ${TEST_MINS}m ${TEST_SECS}s"
   else
-    warn "TEST SUITE FAILED (exit ${TEST_RC})"
+    # 124 is timeout's own exit code, named because the remedy is completely
+    # different from a red suite: nothing about it says the code is wrong. It
+    # still takes the same decision path below — a gate that did not finish has
+    # not passed.
+    if (( TEST_RC == 124 )); then
+      warn "TEST SUITE TIMED OUT after 30 minutes and was killed."
+      warn ""
+      warn "The runner never finished, so this is not a test failure. The usual"
+      warn "cause is a wedged NFS mount (a hard mount retries forever) or a test"
+      warn "waiting on a service this node cannot reach:"
+      warn "    findmnt ${APP_ROOT}/storage/app/public"
+      warn "    bash nfs-latency-check.sh"
+      warn "    tail -40 ${TEST_LOG}"
+    else
+      warn "TEST SUITE FAILED (exit ${TEST_RC})"
+    fi
     warn ""
-    warn "Nothing has been migrated and no cache has been rebuilt. php-fpm has"
-    warn "not been reloaded, so opcache is still serving the PREVIOUS release —"
-    warn "this node is currently unaffected by the new code."
+    warn "Where this node actually stands — it is NOT untouched:"
+    warn "  - the working tree is ${DEPLOY_REF:-the new release}, checked out;"
+    warn "  - vendor/ has been rebuilt, and still carries dev dependencies;"
+    warn "  - public/build has been rebuilt, so the OLD hashed assets are gone;"
+    warn "  - it is in MAINTENANCE MODE, out of the load balancer, serving 503."
+    warn ""
+    warn "What has NOT happened: no migration has run, no cache has been"
+    warn "rebuilt, and php-fpm has not been reloaded, so opcache still holds the"
+    warn "previous bytecode."
     warn ""
     warn "Continuing runs migrations and reloads php-fpm. Migrations are the"
     warn "part that is not simply undone by checking out the old commit."
@@ -907,6 +1110,7 @@ if $PRIMARY; then
   # Run sequentially it is a no-op anyway — the second run finds every migration
   # already recorded. The lock only guards the simultaneous case.
   as_app "php '$APP_ROOT/artisan' migrate --force --isolated"
+  $DRY_RUN || MIGRATED=true
 
   # Theme assets, primary only, right after migrations.
   #
@@ -918,11 +1122,18 @@ if $PRIMARY; then
   # unstyled with nothing in any log explaining it.
   #
   # Idempotent (digest-addressed) and the tree is shared, so one node does it.
-  if grep -qE '^THEME_ASSETS_SERVE_PUBLISHED=true' "$APP_ROOT/.env" 2>/dev/null; then
+  # Anchored, quote-tolerant, and it must be the WHOLE value: the previous
+  # pattern also matched THEME_ASSETS_SERVE_PUBLISHED=truebutnot, and missed the
+  # quoted forms dotenv accepts.
+  if grep -qE '^[[:space:]]*THEME_ASSETS_SERVE_PUBLISHED[[:space:]]*=[[:space:]]*"?'"'"'?true'"'"'?"?[[:space:]]*$' \
+       "$APP_ROOT/.env" 2>/dev/null; then
     as_app "php '$APP_ROOT/artisan' theme:publish-assets --all"
     ok "published theme assets materialised (shared tree, primary only)"
   fi
 else
+  # Vacuously true for a non-primary node: the pre-flight already refused to
+  # continue while anything was pending, so the schema matches this release.
+  $DRY_RUN || MIGRATED=true
   ok "skipped (not primary) — migrations belong to exactly one node"
 fi
 
@@ -931,16 +1142,22 @@ log "8/10 Ownership, SELinux, storage link"
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Sweep the whole tree so nothing composer, npm or git left behind is misowned —
-# but -xdev keeps find on this filesystem, so it never descends into the three
-# NFS binds. chown across NFS is slow, may be refused by ID squashing, and is
-# pointless: the share already carries correct ownership.
+# but -xdev keeps find on this filesystem and the three -prune clauses exclude
+# the mount points by name, so it never descends into the NFS binds even when
+# one of them failed to mount (nofail makes that survivable). chown across NFS
+# is slow, may be refused by ID squashing, and is pointless: the share already
+# carries correct ownership.
 #
 # Only misowned paths are touched, so the common case does no writes at all.
-run "find '$APP_ROOT' -xdev \\( ! -user '$APP_USER' -o ! -group '$APP_GROUP' \\) \
+run "find '$APP_ROOT' -xdev \
+      -path '$APP_ROOT/storage/app/public' -prune -o \
+      -path '$APP_ROOT/storage/app/private' -prune -o \
+      -path '$APP_ROOT/resources/themes' -prune -o \
+      \\( ! -user '$APP_USER' -o ! -group '$APP_GROUP' \\) \
       -exec chown '$APP_USER':'$APP_GROUP' {} + 2>/dev/null || true"
 
-# Same -xdev discipline as the chown above, and for the same reason. This was a
-# bare `chmod -R` on storage/, which descends into storage/app/public and
+# Same -xdev-and-prune discipline as the chown above, and for the same reason.
+# This was a bare `chmod -R` on storage/, which descends into storage/app/public and
 # storage/app/private — the two NFS binds holding every tenant media file and
 # every public-form attachment. On a real media tree that is minutes to hours of
 # NFS metadata traffic INSIDE the maintenance window, it marks every one of
@@ -948,6 +1165,8 @@ run "find '$APP_ROOT' -xdev \\( ! -user '$APP_USER' -o ! -group '$APP_GROUP' \\)
 # (the recommended export setting) it fails silently per file behind
 # 2>/dev/null, so "did nothing" and "rewrote 400,000 files" look identical.
 run "find '$APP_ROOT/storage' '$APP_ROOT/bootstrap/cache' -xdev \
+      -path '$APP_ROOT/storage/app/public' -prune -o \
+      -path '$APP_ROOT/storage/app/private' -prune -o \
       \\( -type d -exec chmod u+rwx,g+rwx {} + -o -type f -exec chmod u+rw,g+rw {} + \\) \
       2>/dev/null || true"
 
@@ -1077,9 +1296,7 @@ fi
 # Written after a healthy deploy so the other nodes can compare against a known
 # good .env rather than against whatever this node happened to have mid-run.
 if $PRIMARY && (( FINAL_RC == 0 )) && [[ -n "${ENV_FINGERPRINT:-}" ]]; then
-  install -o "$APP_USER" -g "$APP_GROUP" -m 0640 /dev/null "$ENV_FINGERPRINT_FILE"
-  printf '%s\n' "$ENV_FINGERPRINT" > "$ENV_FINGERPRINT_FILE"
-  chown "$APP_USER":"$APP_GROUP" "$ENV_FINGERPRINT_FILE" 2>/dev/null || true
+  write_shared_marker "$ENV_FINGERPRINT_FILE" "$ENV_FINGERPRINT" "env fingerprint"
 fi
 
 printf 'ref     : %s\n' "${DEPLOY_REF:-<tracked branch HEAD>}"
