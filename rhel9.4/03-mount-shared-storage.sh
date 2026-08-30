@@ -54,20 +54,26 @@ run() {
   fi
 }
 
+# `read` returns non-zero at EOF, and under set -e that would terminate the
+# script with no output at all — so a run under nohup or from a pipeline looked
+# like a silent crash. This script is interactive by design; say so.
 ask() {
   local prompt=$1 default=${2:-} answer
   if [[ -n "$default" ]]; then
-    read -r -p "$prompt [$default]: " answer
+    read -r -p "$prompt [$default]: " answer \
+      || die "no terminal to prompt on (non-interactive run). Run it under tmux."
     printf '%s' "${answer:-$default}"
   else
-    read -r -p "$prompt: " answer
+    read -r -p "$prompt: " answer \
+      || die "no terminal to prompt on (non-interactive run). Run it under tmux."
     printf '%s' "$answer"
   fi
 }
 
 confirm() {
   local answer
-  read -r -p "$1 [y/N] " answer
+  read -r -p "$1 [y/N] " answer \
+    || die "no terminal to confirm on (non-interactive run). Run it under tmux."
   [[ "$answer" == [yY] ]]
 }
 
@@ -103,10 +109,10 @@ fi
 
 if [[ -z "$EXPORT_ROOT" ]]; then
   printf '\nMounted NFS exports:\n'
-  local_i=1
+  idx=1
   for m in "${NFS_MOUNTS[@]}"; do
-    printf '  %d) %s\n' "$local_i" "$m"
-    local_i=$((local_i + 1))
+    printf '  %d) %s\n' "$idx" "$m"
+    idx=$((idx + 1))
   done
   choice=$(ask "Which one backs this installation? (number, or full path)")
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#NFS_MOUNTS[@]} )); then
@@ -223,8 +229,11 @@ for m in "${MAPPINGS[@]}"; do
     find "$tgt" -mindepth 1 -maxdepth 1 -printf '  %f\n' 2>/dev/null | head -20
 
     if confirm "Copy it to ${src} first (seed the share)?"; then
-      run "cp -a '${tgt}/.' '${src}/'"
-      run "chown -R '$APP_USER':'$APP_GROUP' '$src'"
+      # As the APP USER, not as root. NFS-SHARED-STORAGE.md calls root_squash
+      # "fine and preferred", and under it root's writes on the export are
+      # squashed to nobody and fail — including the chown. The app user is the
+      # identity that has to be able to write there anyway.
+      run "sudo -u '$APP_USER' cp -a '${tgt}/.' '${src}/'"
       ok "seeded $src"
     else
       die "refusing to hide ${local_files} entries under ${tgt}.
@@ -246,32 +255,50 @@ log "5/7  Write fstab entries"
 # ═════════════════════════════════════════════════════════════════════════════
 
 FSTAB_ADDED=0
-BACKUP_MADE=false
+
+# The additions are built in a temp file and appended to /etc/fstab in ONE
+# operation. A sequence of `printf >> /etc/fstab` inside run "..." strings is one
+# interrupted redirect away from a truncated fstab, and an unbootable node.
+FSTAB_NEW=$(mktemp)
+trap 'rm -f "$FSTAB_NEW"' EXIT
+
+{
+  printf '\n# GovExy shared storage — bind mounts from %s\n' "$EXPORT_ROOT"
+  printf '# x-systemd.requires-mounts-for stops a bind firing before NFS is up,\n'
+  printf '# which would silently bind an empty local directory instead.\n'
+  printf '#\n'
+  printf '# nofail is a deliberate trade, and it goes the other way from the one\n'
+  printf '# above. Without it these are boot-blocking: an NFS server that is down\n'
+  printf '# when a web node reboots fails local-fs.target and drops the node to an\n'
+  printf '# emergency console, so an NFS outage takes both web nodes offline\n'
+  printf '# permanently and recovery needs console access to a government VM.\n'
+  printf '# With it, the node boots with the binds absent and would write to local\n'
+  printf '# disk — which 04-deploy.sh already refuses to do, and which a /up health\n'
+  printf '# check plus a mount alarm covers. Nothing covers a node that will not boot.\n'
+  printf '#\n'
+  printf '# Add a mount assertion to this node monitoring:\n'
+  printf '#     findmnt %s/storage/app/public\n' "$APP_ROOT"
+} > "$FSTAB_NEW"
 
 for m in "${MAPPINGS[@]}"; do
   IFS='|' read -r src tgt label <<< "$m"
 
-  if grep -qE "^[^#]*[[:space:]]${tgt//\//\\/}[[:space:]]" /etc/fstab; then
+  # -F, on the target surrounded by spaces. The previous ERE escaped every '/',
+  # which is unnecessary in an ERE and strictly an undefined escape.
+  if grep -q -F " ${tgt} " /etc/fstab || grep -q -F "	${tgt}	" /etc/fstab; then
     ok "fstab entry already present: $tgt"
     continue
   fi
 
-  if ! $BACKUP_MADE; then
-    run "cp -a /etc/fstab '/etc/fstab.bak.\$(date +%s)'"
-    BACKUP_MADE=true
-    if (( FSTAB_ADDED == 0 )); then
-      run "printf '\n# GovExy shared storage — bind mounts from %s\n' '$EXPORT_ROOT' >> /etc/fstab"
-      run "printf '# x-systemd.requires-mounts-for stops a bind firing before NFS is up,\n' >> /etc/fstab"
-      run "printf '# which would silently bind an empty local directory instead.\n' >> /etc/fstab"
-    fi
-  fi
-
-  run "printf '%s  %s  none  bind,x-systemd.requires-mounts-for=%s  0 0\n' \
-        '$src' '$tgt' '$EXPORT_ROOT' >> /etc/fstab"
+  printf '%s  %s  none  bind,nofail,x-systemd.requires-mounts-for=%s  0 0\n' \
+    "$src" "$tgt" "$EXPORT_ROOT" >> "$FSTAB_NEW"
   FSTAB_ADDED=$((FSTAB_ADDED + 1))
 done
 
 if (( FSTAB_ADDED > 0 )); then
+  run "cp -a /etc/fstab '/etc/fstab.bak.\$(date +%s)'"
+  run "cat '$FSTAB_NEW' >> /etc/fstab"
+  $DRY_RUN && sed 's/^/    /' "$FSTAB_NEW"
   ok "added ${FSTAB_ADDED} fstab entries"
 else
   ok "fstab already complete"
@@ -282,7 +309,15 @@ log "6/7  Mount and SELinux"
 # ═════════════════════════════════════════════════════════════════════════════
 
 run "systemctl daemon-reload"
-run "mount -a"
+
+# findmnt --verify first: it reports a malformed entry without acting on it.
+#
+# `mount -a` under set -e used to abort the script before the verify section if
+# any UNRELATED fstab entry failed, leaving the entries just written untested and
+# the operator with no report. Let it warn instead and let step 7 say what is
+# actually mounted.
+run "findmnt --verify --verbose || true"
+run "mount -a || printf '\033[1;33m[warn]\033[0m mount -a reported a failure — step 7 says which paths are affected\n'"
 
 # Without this, SELinux denies nginx/php-fpm access to NFS-backed paths. The
 # symptom is misleading: the file is present, correctly owned, readable by the
@@ -314,17 +349,25 @@ for m in "${MAPPINGS[@]}"; do
 
   # findmnt alone only proves something is mounted there. Write on the share and
   # read through the mount to prove it is the RIGHT something.
+  #
+  # The probe runs as the APP USER, not as root. Under root_squash — which
+  # NFS-SHARED-STORAGE.md calls "fine and preferred" — root's touch is squashed
+  # to nobody and fails, so this reported FAILED=1 on a CORRECTLY configured
+  # export and sent the operator off to loosen it. The app user is the identity
+  # whose access actually matters.
   probe=".mountprobe.$$"
-  if touch "${src}/${probe}" 2>/dev/null; then
+  if sudo -u "$APP_USER" touch "${src}/${probe}" 2>/dev/null; then
     if [[ -e "${tgt}/${probe}" ]]; then
       ok "$tgt  <-  $src"
     else
       warn "MISMATCH: $tgt is mounted but does not reflect $src"
       FAILED=1
     fi
-    rm -f "${src}/${probe}"
+    sudo -u "$APP_USER" rm -f "${src}/${probe}"
   else
-    warn "cannot write to $src — check export permissions and ID mapping"
+    warn "$APP_USER cannot write to $src — check export permissions and ID mapping"
+    warn "(root cannot either, under the recommended root_squash; this checks the"
+    warn " user that matters.)"
     FAILED=1
   fi
 done
