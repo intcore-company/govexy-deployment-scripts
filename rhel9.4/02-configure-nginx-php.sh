@@ -98,6 +98,8 @@ if [[ -z "$LB_IPS" && "$RESTRICT_HTTP_TO_LB" == "yes" ]]; then
   die "RESTRICT_HTTP_TO_LB=yes requires LB_IPS. Set one or the other."
 fi
 
+PHP_POST_MAX="${PHP_POST_MAX:-${PHP_UPLOAD_MAX}}"
+PHP_CLI_MEMORY_LIMIT="${PHP_CLI_MEMORY_LIMIT:-1024M}"
 SECURITY_HEADERS="${SECURITY_HEADERS:-yes}"
 HSTS_MAX_AGE="${HSTS_MAX_AGE:-31536000}"
 HSTS_INCLUDE_SUBDOMAINS="${HSTS_INCLUDE_SUBDOMAINS:-yes}"
@@ -190,9 +192,27 @@ request_terminate_timeout = 120s
 php_admin_value[error_log] = /var/log/php-fpm/www-error.log
 php_admin_flag[log_errors] = on
 
+; The WEB memory limit belongs here, not in /etc/php.d/99-govexy.ini, which the
+; CLI reads too. A web-sized ceiling there also caps artisan — Horizon workers,
+; schedule:run, metering:ingest-edge, theme:publish-assets and the content-bundle
+; importers all run under it.
+php_admin_value[memory_limit] = ${PHP_MEMORY_LIMIT}
+
+; Laravel does not use PHP's own session handler (SESSION_DRIVER=redis does the
+; work), so these only keep the stock directories valid for anything that asks.
 php_value[session.save_handler] = files
 php_value[session.save_path]    = /var/lib/php/session
 php_value[soap.wsdl_cache_dir]  = /var/lib/php/wsdlcache
+
+; RHEL's stock www.conf carries these, and this file is written from scratch.
+; php-fpm's clear_env defaults to ON, so without them the pool starts with an
+; EMPTY environment and every exec(), shell_exec() or Symfony Process call from
+; PHP fails with "command not found" — no PATH, no TMPDIR. Imagick is in-process
+; and unaffected; anything shelling out to gs, pdftoppm, unzip or git is not.
+env[PATH] = /usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+env[TMP] = /tmp
+env[TMPDIR] = /tmp
+env[TEMP] = /tmp
 EOF
 
 install -d -o root -g nginx -m 0770 /var/lib/php/session /var/lib/php/wsdlcache
@@ -201,10 +221,18 @@ install -d -o root -g nginx -m 0770 /var/lib/php/session /var/lib/php/wsdlcache
 log "2/6  PHP runtime settings"
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Read by BOTH SAPIs. The web memory limit is deliberately absent — it is set on
+# the FPM pool instead, so it cannot cap artisan. What is here is the CLI's own
+# limit, which needs to be the larger of the two.
 cat > /etc/php.d/99-govexy.ini <<EOF
-memory_limit = ${PHP_MEMORY_LIMIT}
+memory_limit = ${PHP_CLI_MEMORY_LIMIT}
 upload_max_filesize = ${PHP_UPLOAD_MAX}
-post_max_size = ${PHP_UPLOAD_MAX}
+
+; Must exceed upload_max_filesize: a multipart body carrying a file of exactly
+; upload_max_filesize is larger than it once boundaries and fields are counted,
+; and PHP silently discards the entire body when this is exceeded — the request
+; arrives with no CSRF token and Laravel answers 419.
+post_max_size = ${PHP_POST_MAX}
 max_execution_time = 60
 expose_php = Off
 date.timezone = ${SERVER_TZ}
@@ -299,7 +327,22 @@ rm -f /etc/nginx/conf.d/default.conf
 # valid here and nginx.conf needs no further editing.
 {
   echo "server_tokens off;"
-  echo "client_max_body_size ${PHP_UPLOAD_MAX};"
+  # Follows post_max_size, not upload_max_filesize: nginx must not reject a
+  # multipart body that PHP would have accepted.
+  echo "client_max_body_size ${PHP_POST_MAX};"
+  echo
+  # HTTPS for FastCGI. NOT $http_x_forwarded_proto directly.
+  #
+  # Symfony's Request::isSecure() is !empty($https) && 'off' !== strtolower($https),
+  # so a plaintext request arriving with "X-Forwarded-Proto: http" set HTTPS=http
+  # — non-empty, not "off" — and the framework treated it as SECURE. Only a
+  # request with no XFP header at all was correctly seen as insecure.
+  #
+  # An empty value is what makes PHP see no HTTPS at all, which is the intent.
+  echo 'map $http_x_forwarded_proto $govexy_https {'
+  echo '    default "";'
+  echo '    "https"  "on";'
+  echo '}'
   echo
   echo 'log_format main_lb '"'"'\$remote_addr - \$remote_user [\$time_local] "\$request" '"'"''
   echo '                   '"'"'\$status \$body_bytes_sent "\$http_referer" '"'"''
@@ -458,7 +501,10 @@ ${METER_ACCESS_LOG}
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         fastcgi_param PATH_INFO \$fastcgi_path_info;
-        fastcgi_param HTTPS \$http_x_forwarded_proto;
+        # "on" only when the load balancer says https, empty otherwise. See the
+        # \$govexy_https map in 00-govexy-http.conf for why the raw header
+        # cannot be passed through here.
+        fastcgi_param HTTPS \$govexy_https;
 
         # Overwrite the client-supplied X-Forwarded-For with the address nginx
         # actually resolved. The application trusts proxies at '*', so without
@@ -483,9 +529,14 @@ ${METER_ACCESS_LOG}
         # \$host is what nginx matched the request on, not what the client asserted.
         fastcgi_param HTTP_X_FORWARDED_HOST \$host;
 
-        # X-Forwarded-Proto is trusted the same way and decides whether the
-        # framework thinks the request was secure. Pin it to what the load
-        # balancer actually terminated rather than to a client claim.
+        # X-Forwarded-Proto, passed through as the client sent it — unlike XFF
+        # and XFH above, which are pinned to values nginx established.
+        #
+        # It is NOT pinned, and this comment used to claim it was. With
+        # RESTRICT_HTTP_TO_LB="no" anyone who can reach :80 directly can assert
+        # "https" here. The impact is bounded — a forged URL scheme and secure
+        # cookie flags, not authentication — but it is a claim the config does
+        # not make good on. Restrict :80 to the load balancer to close it.
         fastcgi_param HTTP_X_FORWARDED_PROTO \$http_x_forwarded_proto;
         fastcgi_hide_header X-Powered-By;
         fastcgi_read_timeout 60s;
@@ -496,6 +547,13 @@ ${METER_ACCESS_LOG}
 
     # Nothing else may execute PHP.
     location ~ \.php\$ { return 404; }
+
+    # Defence in depth. Both are gated in the application, and 04-deploy.sh
+    # refuses to deploy unless TELESCOPE_ENABLED=false, but neither has any
+    # business being reachable on a government node. /horizon is deliberately
+    # NOT here: it is the operator's queue dashboard (see 05-configure-workers.sh).
+    location ^~ /telescope { return 404; }
+    location ^~ /pulse     { return 404; }
 
     # Dotfiles stay private, except .well-known, which the application serves
     # through index.php (tenant-managed verification files, ACME challenges).
@@ -585,6 +643,12 @@ ${METER_ACCESS_LOG}
 EOF
 
 nginx -t
+
+# The theme-dist location serves the .gz written at publish time. Checked the
+# same way realip is checked in stage 1: a missing module is silent, and the
+# symptom is that compression is paid per response instead of per build.
+nginx -V 2>&1 | tr ' ' '\n' | grep -q 'gzip_static' || \
+  warn "nginx built without http_gzip_static_module — theme-dist .gz files will not be served"
 
 # ── Meter log rotation ───────────────────────────────────────────────────────
 #
@@ -731,7 +795,11 @@ if [[ "$METER_LOG" == "yes" ]]; then
     tail -1 "${METER_LOG_DIR}/meter.log"
     stat -c '  %n  %U:%G %a' "${METER_LOG_DIR}/meter.log"
 
-    if ! sudo -u nginx test -r "${METER_LOG_DIR}/meter.log"; then
+    # Derived from the application root's owner, like everything else in this
+    # repository — the reader is the app user, which is only coincidentally
+    # nginx today.
+    METER_READER=$(stat -c '%U' "$APP_ROOT" 2>/dev/null || echo nginx)
+    if ! sudo -u "$METER_READER" test -r "${METER_LOG_DIR}/meter.log"; then
       warn "the application user cannot READ the meter log — ingest would report zero bytes forever"
     fi
   else
