@@ -32,6 +32,17 @@ read-only, replaceable code. Two consequences:
 
 Confirm the deploy method before the first release, not after.
 
+### One path not decided here: `storage/app/themes`
+
+Several parts of the application write under `storage/app/themes` (the theme preview and
+screenshot paths, and the seeder, which builds a randomised root there). It is **not** in
+either table above because nobody has confirmed which side it belongs on.
+
+Resolve it with the application team before go-live. If a theme preview generated on one
+node has to be visible from the other, it belongs in §1; if it is regenerated on demand,
+it is node-local and belongs in §2. Until then it is on local disk on each node, which is
+the behaviour of an unmounted path and may be silently wrong.
+
 ---
 
 ## 2. What must NOT be shared
@@ -78,15 +89,43 @@ and monitor accordingly.
 
 ## 4. Mount configuration
 
-Suggested `/etc/fstab` entries, identical on both nodes:
+**Two topologies. Pick one; do not produce a hybrid.**
+
+### 4a. One export, three bind mounts — what the scripts do
+
+This is the supported arrangement and the one `03-mount-shared-storage.sh` builds. The
+storage team mounts **one** export; the script binds three of its subdirectories onto the
+application paths:
 
 ```fstab
-nfs-server:/govexy/media    /var/www/govexy/storage/app/public   nfs4  _netdev,hard,timeo=600,retrans=2,noatime,nodiratime  0 0
-nfs-server:/govexy/private  /var/www/govexy/storage/app/private  nfs4  _netdev,hard,timeo=600,retrans=2,noatime,nodiratime  0 0
-nfs-server:/govexy/themes   /var/www/govexy/resources/themes     nfs4  _netdev,hard,timeo=600,retrans=2,noatime,nodiratime  0 0
+nfs-server:/govexy       /srv/govexy-share                    nfs4  _netdev,hard,timeo=600,retrans=2,noatime,nodiratime  0 0
+/srv/govexy-share/media    /var/www/govexy/storage/app/public   none  bind,nofail,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
+/srv/govexy-share/private  /var/www/govexy/storage/app/private  none  bind,nofail,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
+/srv/govexy-share/themes   /var/www/govexy/resources/themes     none  bind,nofail,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
 ```
 
-Option notes:
+- **`x-systemd.requires-mounts-for`** is what stops a bind firing before the NFS export is
+  up. Without it the bind silently attaches an empty local directory: it looks mounted and
+  is not.
+- **`nofail`** is a deliberate trade. Without it these entries are boot-blocking, so an
+  NFS server that is down when a node reboots fails `local-fs.target` and drops the node to
+  an emergency console — an NFS outage would take both web nodes offline permanently and
+  recovery would need console access to a government VM. With it, a node boots with the
+  binds absent, which `04-deploy.sh` refuses to deploy onto and a `/up` health check plus a
+  mount alarm covers. Add that mount alarm.
+
+### 4b. Three exports mounted directly — the alternative
+
+Equivalent in effect, and simpler if the storage team would rather present three exports.
+`03-mount-shared-storage.sh` does not build this; it is set up by hand.
+
+```fstab
+nfs-server:/govexy/media    /var/www/govexy/storage/app/public   nfs4  _netdev,hard,timeo=600,retrans=2,noatime,nodiratime,nofail  0 0
+nfs-server:/govexy/private  /var/www/govexy/storage/app/private  nfs4  _netdev,hard,timeo=600,retrans=2,noatime,nodiratime,nofail  0 0
+nfs-server:/govexy/themes   /var/www/govexy/resources/themes     nfs4  _netdev,hard,timeo=600,retrans=2,noatime,nodiratime,nofail  0 0
+```
+
+Option notes, for both:
 
 - **`hard`** not `soft`. A soft mount returns I/O errors on server hiccups, which
   surface as corrupted uploads and half-written files. Hard blocks instead —
@@ -117,19 +156,27 @@ readable by the `nginx` user — and every read still fails. Check with
 
 ## 6. Application-side steps after mounting
 
-```bash
-# ownership on the shared paths
-chown -R nginx:nginx /var/www/govexy/storage/app/public \
-                     /var/www/govexy/storage/app/private \
-                     /var/www/govexy/resources/themes
+**Ownership on the shared paths is NOT set from a web node.** Under the `root_squash`
+recommended in §3, a `chown -R` run as root on the export is squashed to `nobody` and
+fails — so the obvious command here would simply not work. Set ownership one of two ways:
 
-# public/storage -> storage/app/public (run once, on either node)
+- at export creation, on the NFS server, to the UID/GID that `id nginx` reports on the web
+  nodes (they must match — see §3); or
+- from a host the export grants `no_root_squash` to, then remove that grant.
+
+`03-mount-shared-storage.sh` seeds the share as the **application user** for the same
+reason, never as root.
+
+```bash
+# public/storage -> storage/app/public — on EVERY node
 sudo -u nginx php artisan storage:link
 ```
 
 `public/storage` is a symlink created by `storage:link`, pointing at
-`storage/app/public`. It lives in the code tree and is therefore node-local,
-which is correct — each node needs its own symlink into the shared target.
+`storage/app/public`. It lives in `public/`, which is part of the code tree and is
+therefore node-local — so creating it on one node does nothing for the other. **Every node
+needs its own.** `04-deploy.sh` creates it per node and warns if an existing link points
+somewhere other than `storage/app/public`.
 Verify on both:
 
 ```bash

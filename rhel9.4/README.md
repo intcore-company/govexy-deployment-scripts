@@ -25,19 +25,25 @@ them away.
 
 | File | Purpose |
 |---|---|
-| `govexy-node.conf` | Shared variables. Sourced by both scripts. **Edit here, never inside the scripts.** |
+| `govexy-node.conf` | Shared variables, including `NODE_ROLE`. Sourced or read by every script. **Edit here, never inside the scripts.** |
 | `01-install-dependencies.sh` | Stage 1 — install only. Repos, packages, PHP 8.4, Composer. Starts no services. No prompts. |
 | `02-configure-nginx-php.sh` | Stage 2 — configuration. FPM pool, php.ini, nginx vhost, SELinux, firewalld; starts and verifies services. Also `--set-lb` mode. **Prompts for confirmation.** |
+| `03-mount-shared-storage.sh` | Stage 3 — bind the three shared paths out of the NFS export onto the application. Interactive; `--dry-run` and `--verify` modes. |
+| `04-deploy.sh` | Stage 4 — **per release, on every node.** Pulls a tag, builds, runs the Pest gate, migrates on the primary, rebuilds caches, reloads FPM. **Prompts for confirmation.** |
+| `05-configure-workers.sh` | Stage 5 — scheduler cron (primary only), Horizon unit, meter-ingest timer. `--status` and `--remove` modes. **Prompts for confirmation.** |
+| `nfs-latency-check.sh` | Diagnostic. Measures NFS stat latency against local disk for the paths Blade actually reads. Writes a 64 MB probe into the media export and removes it. |
 | `NFS-SHARED-STORAGE.md` | Specification for the storage team: which paths must be shared between nodes, which must not, export requirements, fstab, verification. |
+| `TROUBLESHOOTING.md` | Symptom-first index of the failures these scripts produce, and which fix is the correct one. |
 | `README.md` | This file. |
 
-Both scripts are idempotent and safe to re-run.
+Stages 1, 2, 3 and 5 are idempotent provisioning and safe to re-run. Stage 4 is the
+per-release deploy and is idempotent for a clean re-run.
 
 ---
 
 ## 2. Prerequisites
 
-- **Root.** Both scripts exit immediately if `$EUID != 0`.
+- **Root.** Every script exits immediately if `$EUID != 0`.
 - **RHEL 9.x**, x86_64.
 - **An active Red Hat subscription**, attached and entitled. Stage 1 runs
   `subscription-manager repos --enable codeready-builder-for-rhel-9-x86_64-rpms`;
@@ -77,8 +83,8 @@ Known-blocked on this estate, and deliberately routed around:
 
 ## 3. Configuration — `govexy-node.conf`
 
-Every variable is listed. Both scripts `source` this file, so a syntax error here breaks
-both.
+Every variable is listed. Stages 1 and 2 `source` this file, so a syntax error here
+breaks both; stages 3, 4 and 5 read individual keys out of it with `grep`.
 
 ### Identity and locale
 
@@ -86,6 +92,7 @@ both.
 |---|---|---|---|
 | `SERVER_TZ` | yes | `Asia/Dubai` | Stage 1 runs `timedatectl set-timezone`. Stage 2 also writes it as `date.timezone` in `/etc/php.d/99-govexy.ini`. |
 | `NODE_HOSTNAME` | no | `""` | If non-empty, stage 1 runs `hostnamectl set-hostname`. Empty leaves the hostname untouched. Set it per node (`web1.govexy.local`, `web2.govexy.local`). |
+| `NODE_ROLE` | yes | `primary` | `primary` or `secondary`. **Exactly one node in the estate is primary.** It is the node that runs migrations (`04-deploy.sh --primary`) and the only node allowed to carry the scheduler cron — `05-configure-workers.sh` refuses `--scheduler` anywhere else, because Laravel's scheduler has no cross-host lock and a second copy runs every triggered workflow twice. Horizon and the meter ingest run on every node regardless. |
 
 ### Backing services
 
@@ -138,8 +145,10 @@ every entry as IPv4 and dies on a malformed one.
 
 | Variable | Required | Default | Effect |
 |---|---|---|---|
-| `PHP_MEMORY_LIMIT` | yes | `512M` | `memory_limit` in `/etc/php.d/99-govexy.ini`. |
-| `PHP_UPLOAD_MAX` | yes | `128M` | Sets `upload_max_filesize` **and** `post_max_size` in php.ini, **and** `client_max_body_size` in nginx. One value drives all three, so they cannot drift apart. |
+| `PHP_MEMORY_LIMIT` | yes | `512M` | `php_admin_value[memory_limit]` on the **FPM pool only**. Deliberately not in `/etc/php.d/99-govexy.ini`, which both SAPIs read — a web-sized limit there also caps `artisan`, and that covers Horizon workers, `schedule:run`, `metering:ingest-edge`, `theme:publish-assets` and the content-bundle importers. Note `FPM_MAX_CHILDREN` x this value is the pool's theoretical ceiling: 50 x 512M is 25 GB. Size the node against it. |
+| `PHP_CLI_MEMORY_LIMIT` | yes | `1024M` | `memory_limit` in `/etc/php.d/99-govexy.ini`, which the CLI reads. Should be the larger of the two. `04-deploy.sh` passes its own `php -d memory_limit=1G` for the test run rather than relying on it. |
+| `PHP_UPLOAD_MAX` | yes | `128M` | `upload_max_filesize` — the largest **single file**. |
+| `PHP_POST_MAX` | yes | `160M` | `post_max_size` in php.ini and `client_max_body_size` in nginx. **Must exceed `PHP_UPLOAD_MAX`.** A multipart request carrying a file of exactly `PHP_UPLOAD_MAX` is larger than it once boundaries, field names and the CSRF token are counted; PHP then discards the whole body and raises nothing, so `$_POST` and `$_FILES` arrive empty, Laravel sees no CSRF token and returns **419** — a failure that reads as a session problem rather than a size one. They are two values precisely so they can differ in this one controlled direction. |
 | `FPM_MAX_CHILDREN` | yes | `50` | `pm.max_children` in the `www` pool. The rest of the pm tuning is fixed in the script: `pm = dynamic`, `start_servers 8`, `min_spare 6`, `max_spare 12`, `max_requests 500`. |
 
 ### Firewall
@@ -147,6 +156,16 @@ every entry as IPv4 and dies on a malformed one.
 | Variable | Required | Default | Effect |
 |---|---|---|---|
 | `RESTRICT_HTTP_TO_LB` | yes | `no` | `no` opens the `http` and `https` firewalld services to everyone. `yes` removes both and instead adds a rich rule accepting `http` only from each `LB_IPS/32`. Stage 2 **dies** if this is `yes` while `LB_IPS` is empty — that combination would firewall the node off from everything. |
+
+### Deploy
+
+| Variable | Required | Default | Effect |
+|---|---|---|---|
+| `DO_TESTS` | yes | `true` | Whether `04-deploy.sh` runs the Pest suite as a gate before migrating. `false` makes skipping the default for this environment. `--with-tests` and `--skip-tests` on the command line both override it, in either direction — an explicit flag always wins. Note the environment variable `DO_TESTS` does **not**: only this file and the command line can turn the gate off. |
+
+Costs about ten minutes of maintenance mode per node and blocks the deploy on failure.
+A hotfix already tested elsewhere is a fair reason to pass `--skip-tests`; a release that
+has been tested nowhere is not.
 
 ---
 
@@ -166,7 +185,18 @@ not:
 
 ## 5. Run order
 
-Copy the whole directory to the node (all four files must sit together — the scripts
+Five stages. 1 to 3 provision the node and run once; 4 runs once per release on every
+node; 5 runs once per node after the first deploy.
+
+| Stage | Script | When | Where |
+|---|---|---|---|
+| 1 | `01-install-dependencies.sh` | once | every node |
+| 2 | `02-configure-nginx-php.sh` | once | every node |
+| 3 | `03-mount-shared-storage.sh` | once | every node |
+| 4 | `04-deploy.sh --ref <tag>` | every release | every node, **primary first** |
+| 5 | `05-configure-workers.sh` | once, after the first deploy | scheduler on the primary only; Horizon and the meter ingest everywhere |
+
+Copy the whole directory to the node (the whole directory, not a subset — the scripts
 resolve `govexy-node.conf` relative to their own path), edit `govexy-node.conf`, then:
 
 ```bash
@@ -200,7 +230,93 @@ bash 02-configure-nginx-php.sh
 tmux attach -t govexy
 ```
 
-Then repeat both stages on the second node.
+### Stage 3 — shared storage
+
+Interactive. Binds `<export>/media`, `<export>/private` and `<export>/themes` onto
+`storage/app/public`, `storage/app/private` and `resources/themes`. Run `--verify` first
+on a node that is already set up; run it under tmux for the same reason as stage 2.
+
+```bash
+bash 03-mount-shared-storage.sh --dry-run   # show the plan
+bash 03-mount-shared-storage.sh             # do it
+bash 03-mount-shared-storage.sh --verify    # check an existing setup
+```
+
+### Stage 4 — deploy a release
+
+Per release, on every node, **primary first**. `--ref` is required and must name a tag:
+without it each node deploys whatever the tracked branch's HEAD happens to be when that
+node runs, and a push between the first node and the second splits the pair.
+
+```bash
+# primary node — runs migrations
+bash 04-deploy.sh --ref v1.4.24 --primary
+
+# every other node, same ref, one at a time
+bash 04-deploy.sh --ref v1.4.24
+```
+
+The node enters maintenance mode before composer, npm, the build and the test gate, so
+`/up` returns 503 and the load balancer drains it. A non-primary node refuses to deploy
+while migrations are pending, and refuses a ref the primary did not deploy. The script
+exits non-zero if `/up` is not 200 afterwards — do not deploy the next node until it is.
+
+Flags: `--allow-branch`, `--no-pull`, `--skip-build`, `--skip-composer`, `--with-tests`
+(default), `--skip-tests`, `--tests-advisory`, `--dry-run`. `DO_TESTS=false` in
+`govexy-node.conf` makes skipping the default for the environment; `--with-tests` on the
+command line overrides it.
+
+### Stage 5 — scheduler and workers
+
+Once per node, after the first successful deploy.
+
+```bash
+# primary (NODE_ROLE=primary in govexy-node.conf)
+bash 05-configure-workers.sh --scheduler --horizon --meter-ingest
+
+# every other node
+bash 05-configure-workers.sh --horizon --meter-ingest
+
+bash 05-configure-workers.sh --status
+```
+
+`--scheduler` is refused unless `NODE_ROLE=primary`. Laravel's scheduler has no
+cross-host lock, so a second copy runs every triggered workflow twice.
+
+Then repeat stages 1 to 3 and 5 on the second node, and stage 4 for every release.
+
+---
+
+## Rollback
+
+There are no release directories and no symlink switch: the tree is deployed in place.
+So a rollback is a **redeploy of the previous tag**, on every node, primary first:
+
+```bash
+# find the tag that was running
+git -c safe.directory=/var/www/govexy -C /var/www/govexy tag --sort=-creatordate | head
+
+bash 04-deploy.sh --ref v1.4.23 --primary --skip-tests   # primary
+bash 04-deploy.sh --ref v1.4.23 --skip-tests             # every other node
+```
+
+Three things this does and does not do:
+
+- **It does restore the code, `vendor/`, `public/build` and every cache.** composer and
+  npm are re-run against the old lock files and the caches are rebuilt from the old
+  source, so nothing of the new release survives in the tree.
+- **It does NOT reverse migrations.** They stay applied. This is why every migration must
+  be backward compatible with the release before it — add a column in one release, stop
+  writing the old one in the next, drop it in a third (expand/contract). A release that
+  drops or renames a column in a single step cannot be rolled back at all.
+- **Do NOT use `git reset --hard`.** It restores tracked paths, and `resources/themes` is
+  both tracked and an NFS bind mount, so it would put shipped themes over admin-uploaded
+  ones on the shared export — the same hazard as `git clean`, which the deploy script
+  refuses outright. `04-deploy.sh --ref` is the supported route.
+
+The primary records the deployed ref at `storage/app/private/.deployed-ref` on the shared
+export, so a rolled-back primary makes every other node refuse the newer ref until it is
+rolled back too.
 
 ---
 
@@ -237,7 +353,11 @@ requires an interactive `y`.
 #### The vhost, `/etc/nginx/conf.d/govexy.conf`
 
 `listen 80 default_server`, `server_name _`, root `${APP_ROOT}/public`. TLS is expected to
-terminate at the load balancer; `HTTPS` is passed to PHP from `X-Forwarded-Proto`.
+terminate at the load balancer. `HTTPS` is passed to PHP through the `$govexy_https`
+**map**, which yields `on` only for `X-Forwarded-Proto: https` and an empty string
+otherwise — the raw header cannot be forwarded, because Symfony's `Request::isSecure()`
+treats any non-empty value that is not `off` as secure, so a plaintext request carrying
+`X-Forwarded-Proto: http` would have been seen as HTTPS.
 
 | Location | Behaviour |
 |---|---|
@@ -249,8 +369,13 @@ terminate at the load balancer; `HTTPS` is passed to PHP from `X-Forwarded-Proto
 | `^~ /.well-known/` | Passed through to `index.php`: the application serves tenant-managed verification files and ACME challenges. |
 | `~ /\.` | `deny all` — all other dotfiles. |
 | `^~ /storage/theme-dist/` | Published theme assets. `gzip_static on`, `Cache-Control: public, max-age=31536000, immutable`, `try_files $uri =404` — a miss is a cheap 404, never a Laravel boot. `^~` so it beats the static-asset regex below. Inert until the application sets `THEME_ASSETS_SERVE_PUBLISHED=true`; see [Published theme assets](#published-theme-assets). |
-| static assets | 30 d `expires`, `Cache-Control: public, immutable`, access log off, falling back to `index.php` (so theme/media routes still work). |
+| `@theme_dist_404` | Internal named location. `error_page 404 = @theme_dist_404` inside the block above resets the server-level `error_page 404 /index.php`, so a theme-dist miss is answered by nginx and never boots the framework. Stage 2 probes it by **body size**, because Laravel also answers 404. |
+| static assets | 30 d `expires`, `Cache-Control: public, max-age=2592000` — deliberately **not** `immutable`, because these URLs carry no content hash and a tenant's replaced logo would not reach returning visitors. Access log deliberately **ON**: `public/storage` symlinks to the media export, so these bytes are served without PHP ever seeing them and the log is the only place they can still be counted for bandwidth metering. Falls back to `index.php`. |
+| `^~ /telescope`, `^~ /pulse` | `return 404`. Defence in depth — both are gated in the application and `04-deploy.sh` refuses to deploy unless `TELESCOPE_ENABLED=false`. `/horizon` is deliberately left reachable. |
 | `error_page 404` | `/index.php` — Laravel renders 404s. |
+
+`gzip_static on` in the theme-dist block needs `ngx_http_gzip_static_module`; stage 2
+warns if nginx was built without it.
 
 ---
 
@@ -368,8 +493,10 @@ Remaining work, per node unless stated:
    restorecon -R /var/www/govexy
    ```
 
-6. **`storage:link`** — once, on either node (the symlink itself is node-local and must
-   exist on both; see `NFS-SHARED-STORAGE.md` §6):
+6. **`storage:link`** — on **every** node. The symlink is node-local: it lives in
+   `public/`, which is not shared, so creating it on one node does nothing for the other
+   (see `NFS-SHARED-STORAGE.md` §6). `04-deploy.sh` creates it per node and warns if an
+   existing link points somewhere other than `storage/app/public`.
 
    ```bash
    sudo -u nginx php artisan storage:link
@@ -381,8 +508,12 @@ Remaining work, per node unless stated:
    sudo -u nginx php artisan config:cache
    sudo -u nginx php artisan route:cache
    sudo -u nginx php artisan view:cache
+   sudo -u nginx php artisan event:cache
    systemctl reload php-fpm
    ```
+
+   `event:cache` is in the list because `04-deploy.sh` builds it too; a node cached by
+   hand without it behaves differently from one the deploy script touched.
 
    These write to `bootstrap/cache` and `storage/framework/views`, both of which are
    node-local by design — so run them on **every** node, every deploy.
