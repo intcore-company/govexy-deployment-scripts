@@ -92,7 +92,7 @@ breaks both; stages 3, 4 and 5 read individual keys out of it with `grep`.
 |---|---|---|---|
 | `SERVER_TZ` | yes | `Asia/Dubai` | Stage 1 runs `timedatectl set-timezone`. Stage 2 also writes it as `date.timezone` in `/etc/php.d/99-govexy.ini`. |
 | `NODE_HOSTNAME` | no | `""` | If non-empty, stage 1 runs `hostnamectl set-hostname`. Empty leaves the hostname untouched. Set it per node (`web1.govexy.local`, `web2.govexy.local`). |
-| `NODE_ROLE` | yes | `primary` | `primary` or `secondary`. **Exactly one node in the estate is primary.** It is the node that runs migrations (`04-deploy.sh --primary`) and the only node allowed to carry the scheduler cron — `05-configure-workers.sh` refuses `--scheduler` anywhere else, because Laravel's scheduler has no cross-host lock and a second copy runs every triggered workflow twice. Horizon and the meter ingest run on every node regardless. |
+| `NODE_ROLE` | yes | `secondary` | `primary` or `secondary`. Defaults to `secondary` so an unedited copy of this file cannot make a second scheduler by omission — set it to `primary` on exactly one node, deliberately. **Exactly one node in the estate is primary.** It is the node that runs migrations (`04-deploy.sh --primary`) and the only node allowed to carry the scheduler cron — `05-configure-workers.sh` refuses `--scheduler` anywhere else, because Laravel's scheduler has no cross-host lock and a second copy runs every triggered workflow twice. Horizon and the meter ingest run on every node regardless. |
 
 ### Backing services
 
@@ -284,6 +284,33 @@ bash 05-configure-workers.sh --status
 cross-host lock, so a second copy runs every triggered workflow twice.
 
 Then repeat stages 1 to 3 and 5 on the second node, and stage 4 for every release.
+
+---
+
+## Upgrading from an earlier copy of these scripts
+
+`04-deploy.sh` now refuses to deploy unless four keys are right in `.env`. On an
+existing node the first run will abort until they are present — check them before
+the deploy window, not during it:
+
+```bash
+grep -E '^(APP_ENV|APP_DEBUG|TELESCOPE_ENABLED|LICENSE_MODE)=' /var/www/govexy/.env
+```
+
+| Key | Required value | Why the deploy refuses without it |
+|---|---|---|
+| `APP_ENV` | `production` | Gates a dozen framework safeguards. |
+| `APP_DEBUG` | `false` | Otherwise stack traces, config values and the DSN reach visitors. |
+| `TELESCOPE_ENABLED` | `false` | **Most likely to be missing.** `config/telescope.php` defaults it to `true`, and `laravel/telescope` is in `require`, so `--no-dev` leaves it installed. The UI is gated but the *recording* is not: every request, query, job and payload is written to `telescope_entries`, unbounded, on government data. It is absent from older `.env` files, so add it. |
+| `LICENSE_MODE` | present (`onprem`) | `onprem` and `saas` are different products. |
+
+Two other changes affect an existing estate:
+
+- **`NODE_ROLE`** is new in `govexy-node.conf` and defaults to `secondary`. Set it to
+  `primary` on the one node that runs migrations and the scheduler, or
+  `05-configure-workers.sh --scheduler` will refuse.
+- **`--ref` is now required** for a deploy that pulls. There is no "deploy whatever is on
+  the branch" path any more.
 
 ---
 

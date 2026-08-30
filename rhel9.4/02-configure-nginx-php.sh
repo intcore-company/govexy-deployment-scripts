@@ -100,6 +100,39 @@ fi
 
 PHP_POST_MAX="${PHP_POST_MAX:-${PHP_UPLOAD_MAX}}"
 PHP_CLI_MEMORY_LIMIT="${PHP_CLI_MEMORY_LIMIT:-1024M}"
+
+# post_max_size MUST exceed upload_max_filesize, and the whole point of them
+# being two keys is that someone can get that backwards. Normalise the K/M/G
+# suffix to bytes and assert it, rather than writing a pool that silently
+# returns 419 on every upload at the limit.
+to_bytes() {
+  # tr rather than ${v^^}: that is a bash 4 feature and this has to keep working
+  # if the file is ever run under an older shell.
+  local v n
+  v=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+  n="${v%[KMG]}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { printf '0'; return; }
+  case "$v" in
+    *G) printf '%s' $(( n * 1024 * 1024 * 1024 )) ;;
+    *M) printf '%s' $(( n * 1024 * 1024 )) ;;
+    *K) printf '%s' $(( n * 1024 )) ;;
+    *)  printf '%s' "$n" ;;
+  esac
+}
+
+_upload_b=$(to_bytes "$PHP_UPLOAD_MAX")
+_post_b=$(to_bytes "$PHP_POST_MAX")
+(( _upload_b > 0 && _post_b > 0 )) || \
+  die "PHP_UPLOAD_MAX ('${PHP_UPLOAD_MAX}') or PHP_POST_MAX ('${PHP_POST_MAX}') is not a
+       size like 128M. Use an integer with an optional K, M or G suffix."
+(( _post_b > _upload_b )) || \
+  die "PHP_POST_MAX (${PHP_POST_MAX}) must be GREATER than PHP_UPLOAD_MAX (${PHP_UPLOAD_MAX}).
+
+       A multipart body carrying a file of exactly PHP_UPLOAD_MAX is larger than
+       it once boundaries, field names and the CSRF token are counted. PHP then
+       discards the whole body and raises nothing: \$_POST and \$_FILES arrive
+       empty, Laravel sees no CSRF token and returns 419 — which reads as a
+       session problem, not a size one. Allow at least 32M of headroom."
 SECURITY_HEADERS="${SECURITY_HEADERS:-yes}"
 HSTS_MAX_AGE="${HSTS_MAX_AGE:-31536000}"
 HSTS_INCLUDE_SUBDOMAINS="${HSTS_INCLUDE_SUBDOMAINS:-yes}"
@@ -142,7 +175,10 @@ connect-src 'self'; worker-src 'self' blob:"
 
 log "Config: LB=[${LB_IPS:-<none yet>}]  REDIS=${REDIS_HOST}  APP_ROOT=${APP_ROOT}"
 log "        headers=${SECURITY_HEADERS}  frame=${FRAME_OPTIONS}  csp=${CSP_MODE}"
-read -r -p "Correct? [y/N] " confirm
+# read fails at EOF, and under set -e that used to kill the script before die()
+# ran — leaving an operator who used nohup with exit 1 and nothing on screen.
+read -r -p "Correct? [y/N] " confirm \
+  || die "no terminal to confirm on (non-interactive run). Run it under tmux."
 [[ "$confirm" == [yY] ]] || die "aborted"
 
 if [[ "$CSP_MODE" == "enforce" ]]; then
@@ -152,7 +188,8 @@ if [[ "$CSP_MODE" == "enforce" ]]; then
   warn "'self' for scripts and connections, so every one of those will be blocked on"
   warn "public tenant sites — silently, as a browser console error nobody watches."
   warn "Run report-only first unless those origins are already enumerated."
-  read -r -p "Continue with enforce? [y/N] " cspconfirm
+  read -r -p "Continue with enforce? [y/N] " cspconfirm \
+    || die "no terminal to confirm on (non-interactive run). Run it under tmux."
   [[ "$cspconfirm" == [yY] ]] || die "aborted"
 fi
 
@@ -837,7 +874,11 @@ Remaining, per node:
          REDIS_CLIENT=phpredis
          REDIS_HOST=<redis server>
          DB_HOST=<mysql server>
-  4. chown -R nginx:nginx storage bootstrap/cache && restorecon -R <APP_ROOT>
+  4. Ownership: 04-deploy.sh does this per deploy, and does it correctly —
+     it prunes the three NFS binds. Do NOT run a bare
+     `chown -R nginx:nginx storage`: it descends into storage/app/public and
+     storage/app/private, which are the shared media and attachment exports,
+     and root_squash refuses it file by file in silence.
   5. php artisan config:cache route:cache view:cache
      systemctl reload php-fpm
 

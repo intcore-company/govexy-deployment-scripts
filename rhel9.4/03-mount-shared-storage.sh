@@ -233,8 +233,24 @@ for m in "${MAPPINGS[@]}"; do
       # "fine and preferred", and under it root's writes on the export are
       # squashed to nobody and fail — including the chown. The app user is the
       # identity that has to be able to write there anyway.
-      run "sudo -u '$APP_USER' cp -a '${tgt}/.' '${src}/'"
-      ok "seeded $src"
+      #
+      # --no-preserve=ownership because -a implies -p: the app user cannot
+      # chown a file it does not own, so a single root-owned or foreign-owned
+      # file under the target aborted the copy PART WAY THROUGH, leaving the
+      # share half seeded and the script reporting success up to that point.
+      # The files land owned by the app user, which is what they need to be.
+      #
+      # Reported rather than fatal, for the same reason: a partial seed is a
+      # state the operator must see in full, not one to die in the middle of.
+      if run "sudo -u '$APP_USER' cp -a --no-preserve=ownership '${tgt}/.' '${src}/'"; then
+        ok "seeded $src"
+      else
+        warn "seeding $src did not complete — some entries were not copied."
+        warn "The share is PARTIALLY seeded. Compare the two before mounting:"
+        warn "    diff -rq '${tgt}' '${src}'"
+        warn "and copy the remainder as ${APP_USER}, or empty ${src} and start again."
+        SEED_INCOMPLETE=1
+      fi
     else
       die "refusing to hide ${local_files} entries under ${tgt}.
 
@@ -253,6 +269,8 @@ done
 # ═════════════════════════════════════════════════════════════════════════════
 log "5/7  Write fstab entries"
 # ═════════════════════════════════════════════════════════════════════════════
+
+SEED_INCOMPLETE=0
 
 FSTAB_ADDED=0
 
@@ -376,6 +394,9 @@ printf '\n'
 findmnt -o TARGET,SOURCE,FSTYPE "${APP_ROOT}/storage/app/public" \
                                 "${APP_ROOT}/storage/app/private" \
                                 "${APP_ROOT}/resources/themes" 2>/dev/null || true
+
+(( SEED_INCOMPLETE == 0 )) || \
+  warn "one or more shares were only PARTIALLY seeded — see the warnings above"
 
 (( FAILED == 0 )) || die "verification failed — see warnings above"
 

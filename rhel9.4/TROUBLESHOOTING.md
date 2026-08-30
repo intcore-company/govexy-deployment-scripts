@@ -709,6 +709,43 @@ export and they disagree — someone pushed or re-tagged between the two nodes.
 Deploy the ref the primary actually ran, or redeploy the primary with the one you
 want.
 
+**Horizon is dead after a reboot and will not come back**
+
+The one interaction between two settings that are each individually right. The
+fstab bind entries carry `nofail`, so a node whose NFS server is down still
+boots (without it, it drops to an emergency console). `govexy-horizon.service`
+carries `RequiresMountsFor=` the three shared paths, so a worker never starts
+against empty local directories. Put together: if the mounts are absent at boot,
+Horizon's start job **fails**, and systemd does not retry a failed start job. The
+NFS server comes back, the mounts appear, and Horizon stays dead — the queue
+simply stops draining, with nothing in the application logs.
+
+```bash
+bash 05-configure-workers.sh --status     # names this case explicitly
+systemctl status govexy-horizon
+findmnt /var/www/govexy/storage/app/public
+```
+
+`govexy-horizon-mountwait.timer` exists to close this: it checks all three mounts
+once a minute and starts Horizon when they are present. Confirm it is running —
+a node provisioned before it existed will not have it, and needs
+`bash 05-configure-workers.sh --horizon` once.
+
+```bash
+systemctl is-active govexy-horizon-mountwait.timer
+```
+
+To recover by hand:
+
+```bash
+mount -a
+systemctl reset-failed govexy-horizon
+systemctl start govexy-horizon
+```
+
+`reset-failed` is the part people miss: without it `start` on a unit in the
+failed state is refused.
+
 **`resources/themes` is still tracked in git**
 
 A warning, not a failure, and it is the one hazard in this repository that the
