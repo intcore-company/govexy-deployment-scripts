@@ -6,17 +6,27 @@
 # not repeated here.
 #
 # Usage:
-#   bash 04-deploy.sh --ref v1.4.24 --primary   run migrations too (exactly ONE node)
-#   bash 04-deploy.sh --ref v1.4.24             every other node
+#   bash 04-deploy.sh                           deploy the latest on this branch
+#   bash 04-deploy.sh --ref v1.4.24             deploy a pinned tag
+#   bash 04-deploy.sh --primary                 also run migrations (ONE node)
+#
+# With no --ref the script pulls the branch the node is already on, which is the
+# everyday case. --ref pins the deploy to a specific tag (checked out detached)
+# or follows a named branch. Either way the resulting COMMIT is recorded on the
+# shared export and every other node is checked against it, so a pair that ends
+# up on different commits is caught rather than assumed away.
 #
 # The Pest suite runs by default and blocks the deploy if it fails. It costs
 # about ten minutes of maintenance mode per node, so a hotfix that has already
 # been tested elsewhere is a fair reason to pass --skip-tests. A release that
 # has not been tested anywhere is not.
 #
-#   --ref <tag>      REQUIRED with a pull. The release tag to deploy, checked
-#                    out detached so every node lands on the same commit.
-#   --allow-branch   permit --ref to name a branch or bare sha (not a tag)
+#   --ref <tag|branch>
+#                    optional. A tag is checked out detached; a branch is
+#                    checked out and fast-forwarded. Omit it to pull the branch
+#                    this node is already on.
+#   --primary        this node runs migrations. Overrides NODE_ROLE in
+#                    govexy-node.conf; without it the role comes from that file.
 #   --no-pull        code arrives as an artifact; skip git
 #   --skip-build     assets built off-server; public/build already shipped
 #   --skip-composer  vendor/ shipped with the artifact
@@ -49,7 +59,7 @@
 #   old bytecode until it is told otherwise — without the reload a deploy
 #   appears to do nothing at all.
 #
-# Rollback is a redeploy of the previous tag:  bash 04-deploy.sh --ref <previous>
+# Rollback is a redeploy of the previous tag:  bash 04-deploy.sh --ref <previous-tag>
 # Migrations are NOT reversed by it; see the "Rollback" section of README.md.
 
 set -euo pipefail
@@ -75,15 +85,18 @@ DRY_RUN=false
 # The release to deploy. Required with a pull: without it each node deploys
 # whatever the tracked branch's HEAD happens to be when that node runs, and a
 # push between node 1 and node 2 silently splits the pair.
+# Optional. Empty means "pull whatever branch this node is on", which is the
+# normal deploy. A value pins the run to that tag or branch.
 DEPLOY_REF=""
-ALLOW_BRANCH=false
+# Whether --primary was actually typed. The flag OVERRIDES NODE_ROLE, so the two
+# have to be told apart: an unset PRIMARY means "ask the conf", not "secondary".
+PRIMARY_EXPLICIT=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --primary)       PRIMARY=true ;;
+    --primary)       PRIMARY=true; PRIMARY_EXPLICIT=true ;;
     --ref)           shift; DEPLOY_REF="${1:-}"
-                     [[ -n "$DEPLOY_REF" ]] || { printf -- '--ref needs a tag\n' >&2; exit 1; } ;;
-    --allow-branch)  ALLOW_BRANCH=true ;;
+                     [[ -n "$DEPLOY_REF" ]] || { printf -- '--ref needs a tag or branch\n' >&2; exit 1; } ;;
     --no-pull)       DO_PULL=false ;;
     --skip-build)    DO_BUILD=false ;;
     --skip-composer) DO_COMPOSER=false ;;
@@ -149,30 +162,33 @@ if ! $TESTS_EXPLICIT && [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]]; then
   [[ "$conf_tests" == "false" ]] && DO_TESTS=false
 fi
 
-# --primary must agree with NODE_ROLE. They are two statements of the same fact
-# and the failure modes of a disagreement are both bad: --primary on a secondary
-# migrates from the wrong node, and omitting it on the primary means nobody
-# migrates and every node then refuses on pending migrations.
+# Where "is this the primary?" comes from.
+#
+# NODE_ROLE in govexy-node.conf is the standing answer, so an operator who types
+# nothing still gets the right behaviour on both nodes. --primary is the
+# override for the times the standing answer is wrong or not yet written: a
+# rebuild, a failover, a node deployed before its conf was updated.
+#
+# The flag WINS and is not second-guessed. A disagreement is worth saying out
+# loud — it usually means the conf is stale — but refusing to run over it just
+# blocks the operator who already knows what they are doing.
+conf_role=""
 if [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]]; then
   conf_role=$(grep -E '^NODE_ROLE=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
               | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
-  conf_role="${conf_role:-secondary}"
+fi
+conf_role="${conf_role:-secondary}"
 
-  if $PRIMARY && [[ "$conf_role" != "primary" ]]; then
-    die "--primary was given, but NODE_ROLE is '${conf_role}' in govexy-node.conf.
-
-       Migrations belong to exactly one node and this file says it is not this
-       one. Either drop --primary here, or fix NODE_ROLE if this really is the
-       primary — but check the other node is not also claiming it."
+if $PRIMARY_EXPLICIT; then
+  PRIMARY=true
+  if [[ "$conf_role" != "primary" ]]; then
+    warn "--primary given, but NODE_ROLE is '${conf_role}' in govexy-node.conf."
+    warn "Proceeding as PRIMARY on the flag. Exactly one node may be — check the"
+    warn "other one is not also migrating, and update the conf if this is now"
+    warn "permanently the primary."
   fi
-  if ! $PRIMARY && [[ "$conf_role" == "primary" ]]; then
-    die "NODE_ROLE=primary in govexy-node.conf, but --primary was not given.
-
-       This is the node that runs migrations. Without it nothing migrates, and
-       every node — including this one — then refuses to deploy on pending
-       migrations.
-           bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>} --primary"
-  fi
+else
+  [[ "$conf_role" == "primary" ]] && PRIMARY=true
 fi
 
 [[ -d "$APP_ROOT" ]] || die "application root not found: $APP_ROOT"
@@ -325,6 +341,17 @@ reown() {
 PRIMARY_FLAG=""
 $PRIMARY && PRIMARY_FLAG=" --primary"
 
+# Likewise for --ref, which is optional now: a hint that hard-codes "--ref <tag>"
+# is wrong for the common run that pinned nothing, and re-typing it would change
+# what the operator deploys.
+REF_ARG=""
+[[ -n "$DEPLOY_REF" ]] && REF_ARG=" --ref ${DEPLOY_REF}"
+
+# What the run is deploying, for messages. Replaced with the branch name or the
+# resolved ref once step 2 knows; needed before then because cleanup() can fire
+# during the pre-flight.
+DEPLOY_LABEL="${DEPLOY_REF:-the current branch}"
+
 MAINT_ON=false
 # Set once the checkout has swapped the code tree. From that point the node is
 # carrying the NEW release against the OLD schema, so lifting maintenance is a
@@ -369,7 +396,7 @@ cleanup() {
       warn "The deploy stopped (exit ${status}) after the working tree changed but"
       warn "before maintenance mode was entered, so the node never left the load"
       warn "balancer. It is answering requests with:"
-      $CODE_SWAPPED   && warn "  - the ${DEPLOY_REF:-new} source tree, against the PREVIOUS release's"
+      $CODE_SWAPPED   && warn "  - the ${DEPLOY_LABEL} source tree, against the PREVIOUS release's"
       $CODE_SWAPPED   && warn "    vendor/ and cached config;"
       $ASSETS_REBUILT && warn "  - a rebuilt public/build, so every asset URL already handed out is a 404."
       warn ""
@@ -414,7 +441,7 @@ cleanup() {
     # out, so claiming "the working tree is now <tag>" there would be false, and
     # a message that is wrong about the cause is worse than no message.
     if $CODE_SWAPPED; then
-      warn "The working tree is now ${DEPLOY_REF:-the new release} but its migrations"
+      warn "The working tree is now ${DEPLOY_LABEL} but its migrations"
       warn "have NOT run. Lifting maintenance would serve new code against the old"
       warn "schema. This node stays out of the load balancer until you decide."
     else
@@ -427,7 +454,7 @@ cleanup() {
     warn "Either finish the deploy:"
     # PRIMARY holds the strings "true"/"false", so ${PRIMARY:+...} would always
     # expand — "false" is not empty. Branch on the value instead.
-    warn "    bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>}${PRIMARY_FLAG} --skip-tests"
+    warn "    bash 04-deploy.sh${REF_ARG}${PRIMARY_FLAG} --skip-tests"
     warn "or roll the tree back to the running release and lift it by hand:"
     warn "    bash 04-deploy.sh --ref <previous-tag>${PRIMARY_FLAG} --skip-tests"
     warn ""
@@ -575,16 +602,22 @@ if $DO_PULL && ! $DRY_RUN; then
 fi
 
 if $DO_PULL; then
-  [[ -n "$DEPLOY_REF" ]] || die "no --ref given.
+  # No --ref is the normal case: pull the branch this node is on. What makes
+  # that safe across a pair is not the ref, it is the commit marker written
+  # below — the primary records the sha it landed on and every other node is
+  # compared against it, so a push between node 1 and node 2 is caught rather
+  # than silently splitting the two.
+  if [[ -z "$DEPLOY_REF" ]] && ! $DRY_RUN; then
+    git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" symbolic-ref -q HEAD >/dev/null 2>&1 || \
+      die "this checkout is on a DETACHED HEAD and no --ref was given.
 
-       Editions are built from a tagged release and every node must land on the
-       same commit. Without a ref this script deploys whatever the tracked
-       branch's HEAD happens to be when THIS node runs, so a push between the
-       first node and the second splits the pair silently.
+       There is no branch to pull. Either name what to deploy:
+           bash 04-deploy.sh --ref <tag-or-branch>
+       or put the checkout back on a branch first:
+           git -c safe.directory=$APP_ROOT -C $APP_ROOT checkout <branch>
 
-           bash 04-deploy.sh --ref v1.4.24 --primary
-
-       Deploy with --no-pull if the code arrives as an artifact instead."
+       A detached HEAD here is normal after a previous --ref deploy of a tag."
+  fi
 
   # resources/themes is tracked in git AND is an NFS bind holding every theme
   # uploaded through the admin panel. While it stays tracked, a checkout that
@@ -604,7 +637,7 @@ printf '\n'
 printf 'node      : %s\n' "$(hostname)"
 printf 'app root  : %s (%s:%s)\n' "$APP_ROOT" "$APP_USER" "$APP_GROUP"
 printf 'primary   : %s\n' "$PRIMARY"
-printf 'ref       : %s\n' "${DEPLOY_REF:-<tracked branch HEAD>}"
+printf 'deploy    : %s\n' "${DEPLOY_REF:-latest on the current branch}"
 printf 'pull      : %s\n' "$DO_PULL"
 printf 'composer  : %s\n' "$DO_COMPOSER"
 printf 'build     : %s\n' "$DO_BUILD"
@@ -682,73 +715,113 @@ if $DO_PULL; then
 
   root_git "fetch --prune --tags --force"
 
-  # A detached checkout of a TAG, not a pull. A pull deploys the tracked
-  # branch's HEAD as it stands at this instant, so two nodes deployed ten
-  # minutes apart can land on different commits with nothing saying so.
-  #
-  # The tag check is not pedantry: a branch name is a moving target and gives
-  # the same divergence back. --allow-branch exists for the deliberate case
-  # (bisecting a bad release, deploying a fix branch to one node).
-  if ! $DRY_RUN; then
-    git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
-        rev-parse --verify --quiet "${DEPLOY_REF}^{commit}" >/dev/null \
-      || die "no such ref in this repository: ${DEPLOY_REF}
+  # BEFORE any checkout or pull, not after. Either can fail part way and leave
+  # the tree rewritten, and this flag is what tells cleanup() the node is no
+  # longer consistent. Set afterwards, exactly the failures that matter left it
+  # false and the trap said nothing.
+  $DRY_RUN || CODE_SWAPPED=true
+
+  if [[ -z "$DEPLOY_REF" ]]; then
+    # ── No --ref: pull the branch this node is on ──────────────────────────
+    #
+    # Fast-forward only. A merge here would invent a commit that exists on no
+    # other node and on no build server, which is not something a deploy should
+    # ever create; --ff-only turns a diverged local branch into a refusal.
+    root_git "pull --ff-only"
+    DEPLOY_LABEL=$(git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
+                   rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+  else
+    # ── --ref given: a tag is pinned, a branch is followed ─────────────────
+    if ! $DRY_RUN; then
+      git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
+          rev-parse --verify --quiet "${DEPLOY_REF}^{commit}" >/dev/null \
+        || git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
+             rev-parse --verify --quiet "origin/${DEPLOY_REF}^{commit}" >/dev/null \
+        || die "no such tag, branch or commit in this repository: ${DEPLOY_REF}
 
        Available tags:
-           git -c safe.directory=$APP_ROOT -C $APP_ROOT tag --sort=-creatordate | head"
+           git -c safe.directory=$APP_ROOT -C $APP_ROOT tag --sort=-creatordate | head
+       Available branches:
+           git -c safe.directory=$APP_ROOT -C $APP_ROOT branch -r"
+    fi
 
-    if ! git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
+    if git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
            show-ref --verify --quiet "refs/tags/${DEPLOY_REF}"; then
-      $ALLOW_BRANCH || die "${DEPLOY_REF} is not a tag.
+      # A tag is immutable, so detaching is exactly right: the node is pinned to
+      # one commit and cannot drift when someone moves a branch.
+      root_git "checkout --detach '$DEPLOY_REF'"
+      DEPLOY_LABEL="$DEPLOY_REF"
 
-       Releases are tags: a branch or a bare sha moves, or is not reproducible
-       on the second node. Pass --allow-branch if this is deliberate."
-      warn "${DEPLOY_REF} is not a tag; --allow-branch given, continuing"
+    elif git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
+             rev-parse --verify --quiet "refs/remotes/origin/${DEPLOY_REF}" >/dev/null 2>&1; then
+      # A branch: check it out and fast-forward, so the node ends up ON the
+      # branch and a later run with no --ref keeps following it.
+      root_git "checkout '$DEPLOY_REF'"
+      root_git "merge --ff-only 'origin/${DEPLOY_REF}'"
+      DEPLOY_LABEL="$DEPLOY_REF"
+      warn "${DEPLOY_REF} is a branch, not a tag — it moves. The commit is recorded"
+      warn "on the shared export, so the other node is still checked against it."
+
+    else
+      # A bare sha, or a local-only branch. Detach and say so.
+      root_git "checkout --detach '$DEPLOY_REF'"
+      DEPLOY_LABEL="$DEPLOY_REF"
+      warn "${DEPLOY_REF} is neither a tag nor a branch on origin — deploying it detached."
     fi
   fi
 
-  # BEFORE the checkout, not after. A checkout that fails part way through has
-  # still rewritten some of the tree, and the flag is what tells cleanup() the
-  # node is no longer consistent. Set afterwards, an interrupted or failed
-  # checkout left it false and the trap said nothing.
-  $DRY_RUN || CODE_SWAPPED=true
-
-  root_git "checkout --detach '$DEPLOY_REF'"
   root_git "log -1 --pretty='%h %s'"
 
   if ! $DRY_RUN; then
     DEPLOYED_SHA=$(git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" rev-parse HEAD)
-    ok "deployed ref: ${DEPLOY_REF} (${DEPLOYED_SHA})"
+    ok "deployed: ${DEPLOY_LABEL:-HEAD} (${DEPLOYED_SHA})"
   fi
 
   # git wrote as root; hand the tree back before composer and npm run as the
   # app user and hit permission errors on files they cannot touch.
   reown
 else
+  # Nothing was fetched, so there is no commit to record or compare: the tree is
+  # whatever the artifact put there. Say that rather than naming a branch this
+  # run never touched.
+  DEPLOY_LABEL="the existing tree (--no-pull)"
   ok "skipped (--no-pull)"
 fi
 
-# ── Cross-node ref agreement ─────────────────────────────────────────────────
+# ── Cross-node commit agreement ──────────────────────────────────────────────
 #
-# The primary records what it deployed on the shared export; every other node
-# refuses to deploy anything else. This is the check that catches "someone
-# pushed a hotfix between the two nodes" — the failure the tag pinning above
-# makes unlikely and this makes visible.
-if ! $DRY_RUN && [[ -n "$DEPLOY_REF" ]]; then
+# The COMMIT, not the ref name. A tag pins a commit, but a branch does not and
+# "no --ref" pins nothing at all — so comparing ref names would have said two
+# nodes agreed whenever both were told "main", which is exactly when a push
+# between them splits the pair. The sha is the only thing that means "the same
+# code". The ref name rides along in the second field for a human reading it.
+#
+# This now runs on every pulling deploy, not just a pinned one, which is what
+# lets --ref be optional without giving up the guarantee.
+if ! $DRY_RUN && [[ -n "${DEPLOYED_SHA:-}" ]]; then
   if $PRIMARY; then
-    write_shared_marker "$DEPLOYED_REF_FILE" "$DEPLOY_REF" "deployed ref"
-  elif primary_ref=$(sudo -u "$APP_USER" head -1 "$DEPLOYED_REF_FILE" 2>/dev/null \
-                     | awk '{print $1}') && [[ -n "$primary_ref" ]]; then
+    write_shared_marker "$DEPLOYED_REF_FILE" \
+      "${DEPLOYED_SHA} ${DEPLOY_LABEL:-HEAD}" "deployed commit"
+  elif primary_line=$(sudo -u "$APP_USER" head -1 "$DEPLOYED_REF_FILE" 2>/dev/null) \
+       && [[ -n "$primary_line" ]]; then
     # As the app user, for the same reason as the fingerprint above: root is
     # `nobody` here, so [[ -r ]] said "absent" for a file that was plainly there.
-    [[ "$primary_ref" == "$DEPLOY_REF" ]] || \
-      die "the primary node deployed '${primary_ref}', this node was given '${DEPLOY_REF}'.
+    primary_sha=$(awk '{print $1}' <<<"$primary_line")
+    primary_label=$(awk '{print $2}' <<<"$primary_line")
 
-       The two nodes would run different code against one database. Re-run with
-           bash 04-deploy.sh --ref ${primary_ref}
-       or deploy ${DEPLOY_REF} on the primary first."
+    [[ "$primary_sha" == "$DEPLOYED_SHA" ]] || \
+      die "this node is on a different commit than the primary.
+
+           primary : ${primary_sha}  (${primary_label:-?})
+           here    : ${DEPLOYED_SHA}  (${DEPLOY_LABEL:-HEAD})
+
+       The two would run different code against one database — usually a push
+       that landed between the two deploys. Pin this node to what the primary
+       actually deployed:
+           bash 04-deploy.sh --ref ${primary_label:-$primary_sha}
+       or re-deploy the primary onto what you intended first."
   else
-    warn "no ref recorded by a primary node yet (${DEPLOYED_REF_FILE} absent)."
+    warn "no commit recorded by a primary node yet (${DEPLOYED_REF_FILE} absent)."
     warn "Deploy the primary first, or accept that nothing is cross-checking this."
   fi
 fi
@@ -801,7 +874,7 @@ $(printf '%s\n' "$migrate_status" | sed 's/^/       /')
        The primary node has not deployed this release yet. Caching new code
        against the old schema produces errors until it does. Deploy the primary
        first:
-           bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>} --primary"
+           bash 04-deploy.sh${REF_ARG} --primary"
   fi
   ok "no pending migrations — the primary has deployed this release"
 fi
@@ -1216,7 +1289,7 @@ if $DO_TESTS; then
     fi
     warn ""
     warn "Where this node actually stands — it is NOT untouched:"
-    warn "  - the working tree is ${DEPLOY_REF:-the new release}, checked out;"
+    warn "  - the working tree is ${DEPLOY_LABEL}, checked out;"
     warn "  - vendor/ has been rebuilt, and still carries dev dependencies;"
     warn "  - public/build has been rebuilt, so the OLD hashed assets are gone;"
     warn "  - it is in MAINTENANCE MODE, out of the load balancer, serving 503."
@@ -1477,7 +1550,7 @@ if $PRIMARY && (( FINAL_RC == 0 )) && [[ -n "${ENV_FINGERPRINT:-}" ]]; then
   write_shared_marker "$ENV_FINGERPRINT_FILE" "$ENV_FINGERPRINT" "env fingerprint"
 fi
 
-printf 'ref     : %s\n' "${DEPLOY_REF:-<tracked branch HEAD>}"
+printf 'deploy  : %s\n' "$DEPLOY_LABEL"
 git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" log -1 --pretty='commit  : %H %s' 2>/dev/null || true
 
 if [[ -n "${HORIZON_UNIT:-}" ]]; then
@@ -1495,10 +1568,11 @@ Deploy complete on $(hostname).
 when PHP-FPM, MySQL or Redis are down. It is the ONLY endpoint the load balancer
 should check — an nginx-only check answers 200 on a node whose PHP is dead.
 
-Repeat on every other node WITHOUT --primary, with the SAME --ref. Take them one
-at a time so the load balancer always has a healthy member.
+Repeat on every other node WITHOUT --primary. Take them one at a time so the
+load balancer always has a healthy member. Each one is checked against the
+commit this node just recorded, so they cannot drift apart.
 
-    bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>}
+    bash 04-deploy.sh${DEPLOY_REF:+ --ref }${DEPLOY_REF}
 
 Rollback is a redeploy of the previous tag on every node:
 

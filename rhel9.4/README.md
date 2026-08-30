@@ -92,7 +92,7 @@ breaks both; stages 3, 4 and 5 read individual keys out of it with `grep`.
 |---|---|---|---|
 | `SERVER_TZ` | yes | `Asia/Dubai` | Stage 1 runs `timedatectl set-timezone`. Stage 2 also writes it as `date.timezone` in `/etc/php.d/99-govexy.ini`. |
 | `NODE_HOSTNAME` | no | `""` | If non-empty, stage 1 runs `hostnamectl set-hostname`. Empty leaves the hostname untouched. Set it per node (`web1.govexy.local`, `web2.govexy.local`). |
-| `NODE_ROLE` | yes | `secondary` | `primary` or `secondary`. Defaults to `secondary` so an unedited copy of this file cannot make a second scheduler by omission — set it to `primary` on exactly one node, deliberately. **Exactly one node in the estate is primary.** It is the node that runs migrations (`04-deploy.sh --primary`) and the only node allowed to carry the scheduler cron — `05-configure-workers.sh` refuses `--scheduler` anywhere else, because Laravel's scheduler has no cross-host lock and a second copy runs every triggered workflow twice. Horizon and the meter ingest run on every node regardless. |
+| `NODE_ROLE` | yes | `secondary` | `primary` or `secondary`. Defaults to `secondary` so an unedited copy of this file cannot make a second scheduler by omission — set it to `primary` on exactly one node, deliberately. **Exactly one node in the estate is primary.** It is the node that runs migrations (`04-deploy.sh`, or `--primary` to override this setting for one run) and the only node allowed to carry the scheduler cron — `05-configure-workers.sh` refuses `--scheduler` anywhere else, because Laravel's scheduler has no cross-host lock and a second copy runs every triggered workflow twice. Horizon and the meter ingest run on every node regardless. |
 
 ### Backing services
 
@@ -193,7 +193,7 @@ node; 5 runs once per node after the first deploy.
 | 1 | `01-install-dependencies.sh` | once | every node |
 | 2 | `02-configure-nginx-php.sh` | once | every node |
 | 3 | `03-mount-shared-storage.sh` | once | every node |
-| 4 | `04-deploy.sh --ref <tag>` | every release | every node, **primary first** |
+| 4 | `04-deploy.sh` (or `--ref <tag>`) | every release | every node, **primary first** |
 | 5 | `05-configure-workers.sh` | once, after the first deploy | scheduler on the primary only; Horizon and the meter ingest everywhere |
 
 Copy the whole directory to the node (the whole directory, not a subset — the scripts
@@ -244,26 +244,51 @@ bash 03-mount-shared-storage.sh --verify    # check an existing setup
 
 ### Stage 4 — deploy a release
 
-Per release, on every node, **primary first**. `--ref` is required and must name a tag:
-without it each node deploys whatever the tracked branch's HEAD happens to be when that
-node runs, and a push between the first node and the second splits the pair.
+Per release, on every node, **primary first**.
 
 ```bash
-# primary node — runs migrations
-bash 04-deploy.sh --ref v1.4.24 --primary
-
-# every other node, same ref, one at a time
-bash 04-deploy.sh --ref v1.4.24
+# the everyday deploy: pull the latest on the branch this node is on
+bash 04-deploy.sh            # primary, if NODE_ROLE=primary in the conf
+bash 04-deploy.sh            # then every other node, one at a time
 ```
+
+`--ref` pins the run instead, and is optional:
+
+```bash
+bash 04-deploy.sh --ref v1.4.24            # a tag: checked out detached, pinned
+bash 04-deploy.sh --ref release/2026-09    # a branch: checked out, fast-forwarded
+```
+
+**What keeps the two nodes together is the commit, not the ref.** The primary records the
+sha it actually landed on in `storage/app/private/.deployed-ref` on the shared export, and
+every other node compares its own HEAD against it and **refuses to continue if they
+differ** — so a push that lands between the first node and the second is caught whether or
+not anyone passed `--ref`. Comparing ref names would not have done that: two nodes both
+told `main` can be on different commits.
+
+Without `--ref` the script pulls with `--ff-only` and refuses a detached HEAD (which is the
+normal state after a previous `--ref <tag>` deploy — pass a ref, or put the checkout back
+on a branch). It also refuses a dirty tree, always.
+
+Who runs migrations:
+
+| | Result |
+|---|---|
+| `NODE_ROLE=primary`, no flag | primary |
+| `NODE_ROLE=secondary`, no flag | secondary |
+| `--primary` given | **primary**, whatever the conf says — a mismatch only warns |
+
+The flag is the override for a rebuild, a failover, or a node deployed before its conf was
+updated. Only ever give it to one node per release.
 
 The node enters maintenance mode before composer, npm, the build and the test gate, so
 `/up` returns 503 and the load balancer drains it. A non-primary node refuses to deploy
-while migrations are pending, and refuses a ref the primary did not deploy. The script
-exits non-zero if `/up` is not 200 afterwards — do not deploy the next node until it is.
+while migrations are pending. The script exits non-zero if `/up` is not 200 afterwards — do
+not deploy the next node until it is.
 
-Flags: `--allow-branch`, `--no-pull`, `--skip-build`, `--skip-composer`, `--with-tests`
-(default), `--skip-tests`, `--tests-advisory`, `--dry-run`. `DO_TESTS=false` in
-`govexy-node.conf` makes skipping the default for the environment; `--with-tests` on the
+Flags: `--ref <tag|branch>`, `--primary`, `--no-pull`, `--skip-build`, `--skip-composer`,
+`--with-tests` (default), `--skip-tests`, `--tests-advisory`, `--dry-run`. `DO_TESTS=false`
+in `govexy-node.conf` makes skipping the default for the environment; `--with-tests` on the
 command line overrides it.
 
 ### Stage 5 — scheduler and workers
@@ -314,10 +339,12 @@ Four other changes affect an existing estate:
 - **`NODE_ROLE`** is new in `govexy-node.conf` and defaults to `secondary`. Set it to
   `primary` on the one node that runs migrations and the scheduler, or
   `05-configure-workers.sh --scheduler` will refuse.
-- **`--ref` is now required** for a deploy that pulls. There is no "deploy whatever is on
-  the branch" path any more.
-- **`--primary` must agree with `NODE_ROLE`.** `04-deploy.sh` refuses a run where one says
-  primary and the other does not, in either direction.
+- **`--ref` is optional.** With no ref the script pulls the branch the node is on, which is
+  the everyday deploy; `--ref` pins a tag or follows a named branch. What holds the pair
+  together is the recorded commit sha, not the ref name.
+- **`--primary` overrides `NODE_ROLE`.** Without the flag the role comes from the conf
+  (default `secondary`); with it the node is primary regardless, and a disagreement is only
+  a warning.
 
 ---
 

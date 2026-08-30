@@ -699,15 +699,31 @@ new code against the old schema produces errors until it does. Deploy the primar
 first:
 
 ```bash
-bash 04-deploy.sh --ref <tag> --primary
+bash 04-deploy.sh --primary
 ```
 
-**"the primary node deployed X, this node was given Y"**
+`--primary` overrides `NODE_ROLE` for that one run, so it works even on a node
+whose conf says `secondary` — it warns and proceeds.
 
-The primary recorded its ref at `storage/app/private/.deployed-ref` on the shared
-export and they disagree — someone pushed or re-tagged between the two nodes.
-Deploy the ref the primary actually ran, or redeploy the primary with the one you
-want.
+**"this node is on a different commit than the primary"**
+
+The primary recorded the commit sha it landed on in
+`storage/app/private/.deployed-ref` on the shared export, and this node's HEAD is
+not it. Almost always a push that landed between the two deploys: both nodes were
+told to deploy the same branch, and the branch moved in between.
+
+The message prints both shas and the ref name each came from. Pin this node to
+what the primary actually deployed:
+
+```bash
+bash 04-deploy.sh --ref <the ref the message names for the primary>
+```
+
+or, if the newer commit is the one you want everywhere, re-deploy the primary
+first and then come back to this node.
+
+Note the check is on the **commit**, not the ref name — two nodes both told
+`--ref main` can be on different commits, which is exactly the case this catches.
 
 **Horizon is dead after a reboot and will not come back**
 
