@@ -516,6 +516,13 @@ systemctl daemon-reload
 # a genuinely broken unit (bad .env, no Redis) gets restarted every 60 seconds
 # forever, filling the journal and hiding the original failure behind a wall of
 # identical start attempts.
+# On a RE-RUN the mount-wait timer from a previous run is already active, and it
+# would start Horizon underneath the check below — making a unit that cannot
+# stay up look healthy for the three seconds this samples, or racing the enable
+# outright. Stop it for the duration; it is re-enabled once Horizon is
+# confirmed running, which is also what makes the failure message below true.
+systemctl disable --now govexy-horizon-mountwait.timer 2>/dev/null || true
+
 systemctl enable --now govexy-horizon
 sleep 3
 systemctl is-active --quiet govexy-horizon \

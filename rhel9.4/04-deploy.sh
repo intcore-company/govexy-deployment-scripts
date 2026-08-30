@@ -123,12 +123,18 @@ APP_ROOT="/var/www/govexy"
 [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
   APP_ROOT=$(grep -E '^APP_ROOT=' "${SCRIPT_DIR}/govexy-node.conf" | head -1 \
              | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
-APP_ROOT="${APP_ROOT:-/var/www/govexy}"
-# A trailing slash in the conf turns every "$APP_ROOT/storage/..." into a path
-# with a doubled slash. Harmless to the kernel, but the -path -prune clauses in
-# the find sweeps compare strings, and "/var/www/govexy//storage/app/public"
-# never matches what find walks.
+# Strip the trailing slash BEFORE applying the default, not after: a conf
+# carrying APP_ROOT="/" reduces to the empty string, and stripping afterwards
+# left it empty rather than falling back. Every path below would then have been
+# rooted at "/".
+#
+# The slash matters because "$APP_ROOT/storage/..." becomes a doubled-slash
+# path. Harmless to the kernel, but the -path -prune clauses in the find sweeps
+# compare strings, and "/var/www/govexy//storage/app/public" never matches what
+# find actually walks.
 APP_ROOT="${APP_ROOT%/}"
+APP_ROOT="${APP_ROOT:-/var/www/govexy}"
+[[ "$APP_ROOT" == /* ]] || die "APP_ROOT must be an absolute path, got '${APP_ROOT}'"
 
 # A DO_TESTS setting in govexy-node.conf becomes the site-wide default; an
 # explicit --with-tests / --skip-tests on the command line still wins.
@@ -312,6 +318,13 @@ reown() {
         -exec chown '$APP_USER':'$APP_GROUP' {} + 2>/dev/null || true"
 }
 
+# Every rollback command this script prints has to carry --primary when this IS
+# the primary, or the operator follows the hint, migrations never run, and the
+# next node then refuses on pending migrations. Computed once here rather than
+# re-derived at each of the three call sites, where it was simply missing.
+PRIMARY_FLAG=""
+$PRIMARY && PRIMARY_FLAG=" --primary"
+
 MAINT_ON=false
 # Set once the checkout has swapped the code tree. From that point the node is
 # carrying the NEW release against the OLD schema, so lifting maintenance is a
@@ -363,7 +376,7 @@ cleanup() {
       warn "Take it out of the load balancer now, then either finish the deploy"
       warn "or go back to the release that was running:"
       warn "    sudo -u $APP_USER php $APP_ROOT/artisan down --render='errors::503'"
-      warn "    bash 04-deploy.sh --ref <previous-tag> --skip-tests"
+      warn "    bash 04-deploy.sh --ref <previous-tag>${PRIMARY_FLAG} --skip-tests"
       warn ""
     fi
     return 0
@@ -414,13 +427,9 @@ cleanup() {
     warn "Either finish the deploy:"
     # PRIMARY holds the strings "true"/"false", so ${PRIMARY:+...} would always
     # expand — "false" is not empty. Branch on the value instead.
-    if $PRIMARY; then
-      warn "    bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>} --primary --skip-tests"
-    else
-      warn "    bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>} --skip-tests"
-    fi
+    warn "    bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>}${PRIMARY_FLAG} --skip-tests"
     warn "or roll the tree back to the running release and lift it by hand:"
-    warn "    bash 04-deploy.sh --ref <previous-tag> --skip-tests"
+    warn "    bash 04-deploy.sh --ref <previous-tag>${PRIMARY_FLAG} --skip-tests"
     warn ""
     warn "To lift it anyway, knowing the above:"
     warn "    sudo -u $APP_USER php $APP_ROOT/artisan up"
@@ -698,12 +707,17 @@ if $DO_PULL; then
     fi
   fi
 
+  # BEFORE the checkout, not after. A checkout that fails part way through has
+  # still rewritten some of the tree, and the flag is what tells cleanup() the
+  # node is no longer consistent. Set afterwards, an interrupted or failed
+  # checkout left it false and the trap said nothing.
+  $DRY_RUN || CODE_SWAPPED=true
+
   root_git "checkout --detach '$DEPLOY_REF'"
   root_git "log -1 --pretty='%h %s'"
 
   if ! $DRY_RUN; then
     DEPLOYED_SHA=$(git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" rev-parse HEAD)
-    CODE_SWAPPED=true
     ok "deployed ref: ${DEPLOY_REF} (${DEPLOYED_SHA})"
   fi
 
@@ -766,16 +780,21 @@ $(printf '%s\n' "$migrate_status" | sed 's/^/       /')
        Cannot tell whether the primary has deployed this release. Fix the
        database connection or the boot failure above before deploying."
 
-  # Anchored on the batch column that only a real status table has. Bare
-  # 'Ran|Pending' matched any prose containing those words — including a
-  # deprecation notice or an exception message mentioning "Pending".
-  grep -qE '\[[0-9]+\] Ran|Pending' <<<"$migrate_status" || die "migrate:status returned no migration rows:
+  # Anchored on the leader dots that only a real status table has, with the
+  # alternation PARENTHESISED. Bare '\[[0-9]+\] Ran|Pending' binds as
+  # ('\[[0-9]+\] Ran') OR ('Pending'), so the right-hand branch was completely
+  # unanchored and matched any prose containing the word — a deprecation notice
+  # or an exception message was enough.
+  grep -qE '\.{3}\s*(\[[0-9]+\] Ran|Pending)' <<<"$migrate_status" || \
+    die "migrate:status returned no migration rows:
 
 $(printf '%s\n' "$migrate_status" | sed 's/^/       /')
 
        Refusing to treat unrecognised output as 'nothing pending'."
 
-  pending=$(grep -c 'Pending' <<<"$migrate_status" || true)
+  # Same anchor as the check above, or the count includes any line that merely
+  # says "Pending".
+  pending=$(grep -cE '\.{3}\s*Pending' <<<"$migrate_status" || true)
   if (( pending > 0 )); then
     die "${pending} migrations are still pending.
 
@@ -867,8 +886,11 @@ if ! $DRY_RUN; then
     # Any non-file driver (cache, and whatever else a release adds): ask the
     # node what it is actually serving. /up is the load balancer's own health
     # check, so a 503 here is precisely "the LB will drain me".
+    # || true, not || echo 000: curl -w '%{http_code}' already prints 000 when
+    # it cannot connect, so the fallback appended a SECOND value and the
+    # comparison below then tested the string "000000".
     maint_code=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 20 \
-      -H "Host: $(hostname -f 2>/dev/null || hostname)" http://127.0.0.1/up || echo 000)
+      -H "Host: $(hostname -f 2>/dev/null || hostname)" http://127.0.0.1/up || true)
     maint_ok=false
     [[ "$maint_code" == "503" ]] && maint_ok=true
     maint_how="/up returned ${maint_code}, expected 503"
@@ -931,8 +953,13 @@ if $DO_BUILD; then
     warn "no package-lock.json — falling back to 'npm install' (unpinned versions)"
     as_app_env "npm --prefix '$APP_ROOT' install"
   fi
-  as_app_env "npm --prefix '$APP_ROOT' run build"
+  # BEFORE the build, not after. Vite's emptyOutDir deletes public/build as its
+  # FIRST act, so a build that fails half way has already destroyed the hashed
+  # assets the running release was serving. Setting the flag afterwards meant
+  # exactly the failure that most needs the node held down left it false, and
+  # cleanup() cheerfully lifted maintenance onto a site with no CSS.
   $DRY_RUN || ASSETS_REBUILT=true
+  as_app_env "npm --prefix '$APP_ROOT' run build"
 else
   ok "skipped (--skip-build)"
 fi
@@ -1219,7 +1246,7 @@ if $DO_TESTS; then
        That is the same hazard as the 'git clean' this script refuses.
 
            git -c safe.directory=${APP_ROOT} -C ${APP_ROOT} tag --sort=-creatordate | head
-           bash 04-deploy.sh --ref <previous-tag> --skip-tests
+           bash 04-deploy.sh --ref <previous-tag>${PRIMARY_FLAG} --skip-tests
 
        Full output: ${TEST_LOG}"
       fi
@@ -1231,6 +1258,10 @@ if $DO_TESTS; then
   if $DO_COMPOSER; then
     log "    removing dev dependencies"
     as_app_env "composer install --working-dir='$APP_ROOT' --no-dev --optimize-autoloader --no-interaction --prefer-dist"
+    # They are gone, so cleanup() must not run the strip a second time on a
+    # later failure — that is a full dependency resolve inside the window for
+    # nothing.
+    $DRY_RUN || DEV_DEPS_INSTALLED=false
   else
     warn "dev dependencies remain installed (--skip-composer given with --with-tests)"
   fi
@@ -1433,7 +1464,7 @@ FINAL_RC=0
 # catch-all, but the application resolves the tenant from the host, so a bare IP
 # is not what a real request looks like.
 UP_CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 20 \
-  -H "Host: $(hostname -f 2>/dev/null || hostname)" http://127.0.0.1/up || echo 000)
+  -H "Host: $(hostname -f 2>/dev/null || hostname)" http://127.0.0.1/up || true)
 printf 'up      : %s\n' "$UP_CODE"
 if [[ "$UP_CODE" != "200" ]]; then
   warn "/up returned ${UP_CODE} — this node is NOT healthy. Do not deploy the next node."

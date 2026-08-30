@@ -148,7 +148,7 @@ every entry as IPv4 and dies on a malformed one.
 | `PHP_MEMORY_LIMIT` | yes | `512M` | `php_admin_value[memory_limit]` on the **FPM pool only**. Deliberately not in `/etc/php.d/99-govexy.ini`, which both SAPIs read — a web-sized limit there also caps `artisan`, and that covers Horizon workers, `schedule:run`, `metering:ingest-edge`, `theme:publish-assets` and the content-bundle importers. Note `FPM_MAX_CHILDREN` x this value is the pool's theoretical ceiling: 50 x 512M is 25 GB. Size the node against it. |
 | `PHP_CLI_MEMORY_LIMIT` | yes | `1024M` | `memory_limit` in `/etc/php.d/99-govexy.ini`, which the CLI reads. Should be the larger of the two. `04-deploy.sh` passes its own `php -d memory_limit=1G` for the test run rather than relying on it. |
 | `PHP_UPLOAD_MAX` | yes | `128M` | `upload_max_filesize` — the largest **single file**. |
-| `PHP_POST_MAX` | yes | `160M` | `post_max_size` in php.ini and `client_max_body_size` in nginx. **Must exceed `PHP_UPLOAD_MAX`.** A multipart request carrying a file of exactly `PHP_UPLOAD_MAX` is larger than it once boundaries, field names and the CSRF token are counted; PHP then discards the whole body and raises nothing, so `$_POST` and `$_FILES` arrive empty, Laravel sees no CSRF token and returns **419** — a failure that reads as a session problem rather than a size one. They are two values precisely so they can differ in this one controlled direction. |
+| `PHP_POST_MAX` | no | `PHP_UPLOAD_MAX` + 8M | `post_max_size` in php.ini and `client_max_body_size` in nginx. **Must exceed `PHP_UPLOAD_MAX`.** A multipart request carrying a file of exactly `PHP_UPLOAD_MAX` is larger than it once boundaries, field names and the CSRF token are counted; PHP then discards the whole body and raises nothing, so `$_POST` and `$_FILES` arrive empty, Laravel sees no CSRF token and returns **419** — a failure that reads as a session problem rather than a size one. They are two values precisely so they can differ in this one controlled direction. |
 | `FPM_MAX_CHILDREN` | yes | `50` | `pm.max_children` in the `www` pool. The rest of the pm tuning is fixed in the script: `pm = dynamic`, `start_servers 8`, `min_spare 6`, `max_spare 12`, `max_requests 500`. |
 
 ### Firewall
@@ -304,7 +304,7 @@ grep -E '^(APP_ENV|APP_DEBUG|TELESCOPE_ENABLED|LICENSE_MODE)=' /var/www/govexy/.
 | `TELESCOPE_ENABLED` | `false` | **Most likely to be missing.** `config/telescope.php` defaults it to `true`, and `laravel/telescope` is in `require`, so `--no-dev` leaves it installed. The UI is gated but the *recording* is not: every request, query, job and payload is written to `telescope_entries`, unbounded, on government data. It is absent from older `.env` files, so add it. |
 | `LICENSE_MODE` | present (`onprem`) | `onprem` and `saas` are different products. |
 
-Three other changes affect an existing estate:
+Four other changes affect an existing estate:
 
 - **`PHP_POST_MAX`** is new in `govexy-node.conf`. A conf written before it existed still
   works — stage 2 derives `PHP_UPLOAD_MAX + 8M` — but set it explicitly if you want a
