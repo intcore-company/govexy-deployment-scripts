@@ -140,9 +140,16 @@ APP_GROUP=$(stat -c '%G' "$APP_ROOT")
 # same node interleave composer, npm and the cache commands on one tree, and
 # neither run's output says so. Node-local by design: the primary-only guard for
 # migrations is --isolated, which locks in the shared cache store.
+#
+# The `exec 9>` is guarded: on RHEL /var/lock is a symlink to /run/lock and always
+# exists, but a failed redirect under set -e would abort the deploy with a bare
+# shell error and no explanation. Degrade to a warning rather than that.
 if ! $DRY_RUN; then
-  exec 9>/var/lock/govexy-deploy.lock
-  flock -n 9 || die "another deploy is already running on this node"
+  if exec 9>/var/lock/govexy-deploy.lock; then
+    flock -n 9 || die "another deploy is already running on this node"
+  else
+    warn "could not open /var/lock/govexy-deploy.lock — concurrent deploys are not guarded"
+  fi
 fi
 
 # Cross-node markers.
