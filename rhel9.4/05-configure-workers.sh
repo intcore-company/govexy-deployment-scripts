@@ -88,7 +88,12 @@ APP_ROOT="${APP_ROOT:-/var/www/govexy}"
 [[ -d "$APP_ROOT" ]] || die "application root not found: $APP_ROOT"
 APP_USER=$(stat -c '%U' "$APP_ROOT")
 APP_GROUP=$(stat -c '%G' "$APP_ROOT")
-PHP_BIN=$(command -v php)
+# `command -v` failing inside a command substitution does NOT abort under set -e
+# — the assignment succeeds with an empty value. Every generated unit then
+# carries "ExecStart= /var/www/govexy/artisan horizon", which systemd rejects at
+# daemon-reload with a message about an absolute path, a long way from the cause.
+PHP_BIN=$(command -v php || true)
+[[ -x "$PHP_BIN" ]] || die "php is not on root's PATH — run 01-install-dependencies.sh first"
 
 CRON_FILE="/etc/cron.d/govexy-scheduler"
 UNIT_FILE="/etc/systemd/system/govexy-horizon.service"
@@ -141,7 +146,9 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 if $DO_REMOVE; then
   log "Removing scheduler and Horizon"
-  rm -f "$CRON_FILE" && ok "cron entry removed"
+  # The logrotate fragment goes with the cron entry. Left behind, logrotate
+  # warns about a missing file forever.
+  rm -f "$CRON_FILE" /etc/logrotate.d/govexy-scheduler && ok "cron entry removed"
   if systemctl list-unit-files govexy-horizon.service &>/dev/null; then
     systemctl disable --now govexy-horizon 2>/dev/null || true
     rm -f "$UNIT_FILE"
@@ -169,6 +176,35 @@ log "Pre-flight"
 # ─────────────────────────────────────────────────────────────────────────────
 
 [[ -f "$APP_ROOT/.env" ]] || die ".env missing at $APP_ROOT/.env"
+
+# The scheduler is a property of the NODE, not of the command line. Reading the
+# role from govexy-node.conf makes "which node runs it" a committed, diffable
+# fact rather than a flag someone remembers to pass — the warning below was the
+# only thing standing between an estate and every workflow running twice.
+if $DO_SCHEDULER; then
+  NODE_ROLE_CFG="primary"
+  [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
+    NODE_ROLE_CFG=$(grep -E '^NODE_ROLE=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
+                    | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}')
+  NODE_ROLE_CFG="${NODE_ROLE_CFG:-primary}"
+
+  [[ "$NODE_ROLE_CFG" == "primary" ]] || die "NODE_ROLE is '${NODE_ROLE_CFG}' in govexy-node.conf.
+
+       The scheduler belongs on the primary node only. Laravel's scheduler has
+       no cross-host lock, so a second copy fires workflow:process-scheduled
+       twice a minute and every triggered workflow executes twice.
+
+       Install Horizon and the meter ingest here instead:
+           bash 05-configure-workers.sh --horizon --meter-ingest"
+
+  # 05 restarts crond under set -e. On a minimal RHEL 9 install cronie is not
+  # present, so the cron file was written and the script then died — leaving a
+  # node that looks configured and runs no scheduled work at all.
+  command -v crond >/dev/null 2>&1 || die "cronie is not installed — the scheduler cannot run.
+
+       dnf -y install cronie && systemctl enable --now crond
+       (01-install-dependencies.sh installs it.)"
+fi
 
 # Horizon needs Redis. Fail here rather than leaving a service that restart-loops.
 if $DO_HORIZON; then
@@ -274,7 +310,10 @@ if $DO_SCHEDULER; then
   warn "Check the other node with:  bash 05-configure-workers.sh --status"
 fi
 
-read -r -p $'\nProceed? [y/N] ' answer
+# read returns non-zero at EOF, and under set -e that terminates the script
+# before die() is reached — a run under nohup exited 1 with a blank screen.
+read -r -p $'\nProceed? [y/N] ' answer \
+  || die "no terminal to confirm on (non-interactive run). Run it under tmux."
 [[ "$answer" == [yY] ]] || die "aborted"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,7 +336,10 @@ SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 MAILTO=""
 
-* * * * * ${APP_USER} cd ${APP_ROOT} && ${PHP_BIN} artisan schedule:run >> ${APP_ROOT}/storage/logs/scheduler.log 2>&1
+# '|| exit 1' rather than '&&': if APP_ROOT is unmounted or renamed the cd
+# fails, an && short-circuits, cron sees exit 0 and MAILTO="" swallows it — so
+# scheduled work stops with no trace anywhere. This way cron records a failure.
+* * * * * ${APP_USER} cd ${APP_ROOT} || exit 1; ${PHP_BIN} artisan schedule:run >> ${APP_ROOT}/storage/logs/scheduler.log 2>&1
 EOF
 
 chmod 644 "$CRON_FILE"
@@ -327,8 +369,24 @@ log "Horizon"
 cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=GovExy Horizon queue supervisor
-After=network-online.target redis.service
+
+# NOT redis.service: Redis is remote on this estate, so there is no such unit
+# here and the ordering directive was silently inert.
+#
+# remote-fs.target plus RequiresMountsFor is the dependency that matters.
+# Queued jobs process media, form attachments and themes; a worker that starts
+# before the three binds land writes into the empty local directories
+# underneath them — the exact failure 03-mount-shared-storage.sh exists to
+# prevent for the deploy path, arriving by the queue instead.
+After=network-online.target remote-fs.target
 Wants=network-online.target
+RequiresMountsFor=${APP_ROOT}/storage/app/public ${APP_ROOT}/storage/app/private ${APP_ROOT}/resources/themes
+
+# Restart=always with RestartSec=5 does not trip systemd's default
+# StartLimitBurst=5 in a 10 s window — but that is true by arithmetic, not by
+# intent. Without this, a future RestartSec change plus a transient Redis outage
+# would leave Horizon permanently 'failed' with nothing processing the queue.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -375,8 +433,12 @@ cat > "$METER_SERVICE" <<EOF
 [Unit]
 Description=GovExy edge bandwidth meter ingest (this node)
 Documentation=https://github.com/intcore-company/govexy-docs
-After=network-online.target nginx.service
+After=network-online.target remote-fs.target nginx.service
 Wants=network-online.target
+
+# Same reason as the Horizon unit: the ingest boots the framework, which reads
+# and writes under the shared paths.
+RequiresMountsFor=${APP_ROOT}/storage/app/public ${APP_ROOT}/storage/app/private ${APP_ROOT}/resources/themes
 
 # A run that fails FAST must not be mistaken for a run that never started. The
 # command records its own failure on the cursor row when it can reach the
