@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 #
 # Measure NFS latency against local disk for the paths the application actually
-# reads. Read-only apart from a few probe files it removes afterwards.
+# reads. Read-only apart from a few probe files it removes afterwards — EXCEPT
+# section 4, which writes a 64 MB file into storage/app/public (the production
+# tenant media export) and deletes it. The EXIT trap removes it if the run is
+# interrupted; without that it would be left in the media root, where it is also
+# reachable over HTTP at /storage/.nfsbench.<pid>.
 #
 # Usage: bash nfs-latency-check.sh [APP_ROOT]
 #
@@ -23,10 +27,14 @@ ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
 
 [[ -d "$APP_ROOT" ]] || { echo "no such directory: $APP_ROOT" >&2; exit 1; }
 mkdir -p "$LOCAL_DIR"
-trap 'rm -rf "$LOCAL_DIR"' EXIT
 
 THEMES="$APP_ROOT/resources/themes"
 MEDIA="$APP_ROOT/storage/app/public"
+
+# The media probe is 64 MB and lives on the PRODUCTION media export. An
+# interrupted run between dd and rm would leave it there permanently, served
+# over HTTP at /storage/.nfsbench.<pid>.
+trap 'rm -rf "$LOCAL_DIR"; rm -f "$MEDIA/.nfsbench.$$" 2>/dev/null' EXIT
 
 # ─────────────────────────────────────────────────────────────────────────────
 log "1. Mount configuration"
@@ -101,7 +109,10 @@ fi
 
 if [ "${LOCAL_US:-0}" -gt 0 ] && [ "${NFS_US:-0}" -gt 0 ]; then
   if [ "$NFS_US" -ge "$LOCAL_US" ]; then
-    printf '\n  NFS is %sx slower per stat than local disk\n' "$(( NFS_US * 100 / LOCAL_US ))e-2"
+    # awk, not integer arithmetic with an "e-2" suffix pasted on: that printed
+    # "NFS is 250e-2x slower", which is a number nobody reads as 2.5.
+    awk -v n="$NFS_US" -v l="$LOCAL_US" \
+      'BEGIN { printf "\n  NFS is %.1fx slower per stat than local disk\n", n/l }'
   else
     printf '\n  NFS stat is not slower than local here (%s vs %s us)\n' "$NFS_US" "$LOCAL_US"
   fi
@@ -163,9 +174,16 @@ else
   warn "nfsstat not installed:  dnf -y install nfs-utils"
 fi
 
-printf '\nMounted-path attribute cache settings:\n'
-grep -hE 'acregmin|acregmax|actimeo|noac' /proc/self/mountinfo 2>/dev/null | head -3 || \
+# The mount under test, not /proc/self/mountinfo — that is the MOUNTING
+# process's view and says nothing about $THEMES. $OPTS is already the right
+# source, captured in section 1.
+printf '\nAttribute cache settings on %s:\n' "$THEMES"
+if [[ "$OPTS" == *ac* || "$OPTS" == *noac* ]]; then
+  printf '%s\n' "$OPTS" | tr ',' '\n' | grep -E 'acregmin|acregmax|actimeo|noac' | sed 's/^/  /' || \
+    printf '  (defaults in use)\n'
+else
   printf '  (defaults in use)\n'
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 log "6. Are compiled views local?"

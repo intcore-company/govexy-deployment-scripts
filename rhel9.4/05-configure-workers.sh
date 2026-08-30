@@ -82,16 +82,23 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT="/var/www/govexy"
 [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
   APP_ROOT=$(grep -E '^APP_ROOT=' "${SCRIPT_DIR}/govexy-node.conf" | head -1 \
-             | cut -d= -f2- | tr -d '"' | awk '{print $1}')
+             | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
 APP_ROOT="${APP_ROOT:-/var/www/govexy}"
 
 [[ -d "$APP_ROOT" ]] || die "application root not found: $APP_ROOT"
 APP_USER=$(stat -c '%U' "$APP_ROOT")
 APP_GROUP=$(stat -c '%G' "$APP_ROOT")
-PHP_BIN=$(command -v php)
+# `command -v` failing inside a command substitution does NOT abort under set -e
+# — the assignment succeeds with an empty value. Every generated unit then
+# carries "ExecStart= /var/www/govexy/artisan horizon", which systemd rejects at
+# daemon-reload with a message about an absolute path, a long way from the cause.
+PHP_BIN=$(command -v php || true)
+[[ -x "$PHP_BIN" ]] || die "php is not on root's PATH — run 01-install-dependencies.sh first"
 
 CRON_FILE="/etc/cron.d/govexy-scheduler"
 UNIT_FILE="/etc/systemd/system/govexy-horizon.service"
+MOUNTWAIT_SERVICE="/etc/systemd/system/govexy-horizon-mountwait.service"
+MOUNTWAIT_TIMER="/etc/systemd/system/govexy-horizon-mountwait.timer"
 METER_SERVICE="/etc/systemd/system/govexy-meter-ingest.service"
 METER_TIMER="/etc/systemd/system/govexy-meter-ingest.timer"
 METER_FAILURE="/etc/systemd/system/govexy-meter-ingest-failure.service"
@@ -112,6 +119,36 @@ if $DO_STATUS; then
   log "Horizon"
   if systemctl list-unit-files govexy-horizon.service &>/dev/null; then
     systemctl status govexy-horizon --no-pager -n 5 || true
+
+    # The specific failure worth naming: Horizon requires the three shared
+    # mounts, the fstab entries carry nofail, and systemd does not retry a
+    # failed start job. An NFS server down at boot therefore leaves Horizon
+    # permanently failed long after the mounts come back.
+    if ! systemctl is-active --quiet govexy-horizon; then
+      missing=()
+      for m in "$APP_ROOT/storage/app/public" "$APP_ROOT/storage/app/private" \
+               "$APP_ROOT/resources/themes"; do
+        findmnt -rn "$m" &>/dev/null || missing+=("$m")
+      done
+      if (( ${#missing[@]} > 0 )); then
+        warn "Horizon is not running and these shared mounts are ABSENT:"
+        printf '      %s\n' "${missing[@]}"
+        warn "That is why it will not start. Fix the mounts:  mount -a"
+      else
+        warn "Horizon is not running but all three mounts are present."
+        warn "If the node booted while NFS was down, systemd failed the start job"
+        warn "and does not retry. Clear it and start:"
+        warn "    systemctl reset-failed govexy-horizon && systemctl start govexy-horizon"
+      fi
+    fi
+
+    if systemctl list-unit-files govexy-horizon-mountwait.timer &>/dev/null; then
+      systemctl is-active --quiet govexy-horizon-mountwait.timer \
+        && ok "mount-wait timer active (recovers Horizon after an NFS outage)" \
+        || warn "mount-wait timer is NOT active — Horizon will not self-recover"
+    else
+      warn "no mount-wait timer — re-run with --horizon to install it"
+    fi
   else
     warn "no systemd unit — queued jobs are NOT processed on this node"
   fi
@@ -141,12 +178,15 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 if $DO_REMOVE; then
   log "Removing scheduler and Horizon"
-  rm -f "$CRON_FILE" && ok "cron entry removed"
+  # The logrotate fragment goes with the cron entry. Left behind, logrotate
+  # warns about a missing file forever.
+  rm -f "$CRON_FILE" /etc/logrotate.d/govexy-scheduler && ok "cron entry removed"
   if systemctl list-unit-files govexy-horizon.service &>/dev/null; then
+    systemctl disable --now govexy-horizon-mountwait.timer 2>/dev/null || true
     systemctl disable --now govexy-horizon 2>/dev/null || true
-    rm -f "$UNIT_FILE"
+    rm -f "$UNIT_FILE" "$MOUNTWAIT_SERVICE" "$MOUNTWAIT_TIMER"
     systemctl daemon-reload
-    ok "Horizon unit removed"
+    ok "Horizon unit and its mount-wait timer removed"
   fi
   if systemctl list-unit-files govexy-meter-ingest.timer &>/dev/null; then
     systemctl disable --now govexy-meter-ingest.timer 2>/dev/null || true
@@ -169,6 +209,35 @@ log "Pre-flight"
 # ─────────────────────────────────────────────────────────────────────────────
 
 [[ -f "$APP_ROOT/.env" ]] || die ".env missing at $APP_ROOT/.env"
+
+# The scheduler is a property of the NODE, not of the command line. Reading the
+# role from govexy-node.conf makes "which node runs it" a committed, diffable
+# fact rather than a flag someone remembers to pass — the warning below was the
+# only thing standing between an estate and every workflow running twice.
+if $DO_SCHEDULER; then
+  NODE_ROLE_CFG="primary"
+  [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
+    NODE_ROLE_CFG=$(grep -E '^NODE_ROLE=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
+                    | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
+  NODE_ROLE_CFG="${NODE_ROLE_CFG:-secondary}"
+
+  [[ "$NODE_ROLE_CFG" == "primary" ]] || die "NODE_ROLE is '${NODE_ROLE_CFG}' in govexy-node.conf.
+
+       The scheduler belongs on the primary node only. Laravel's scheduler has
+       no cross-host lock, so a second copy fires workflow:process-scheduled
+       twice a minute and every triggered workflow executes twice.
+
+       Install Horizon and the meter ingest here instead:
+           bash 05-configure-workers.sh --horizon --meter-ingest"
+
+  # 05 restarts crond under set -e. On a minimal RHEL 9 install cronie is not
+  # present, so the cron file was written and the script then died — leaving a
+  # node that looks configured and runs no scheduled work at all.
+  command -v crond >/dev/null 2>&1 || die "cronie is not installed — the scheduler cannot run.
+
+       dnf -y install cronie && systemctl enable --now crond
+       (01-install-dependencies.sh installs it.)"
+fi
 
 # Horizon needs Redis. Fail here rather than leaving a service that restart-loops.
 if $DO_HORIZON; then
@@ -197,7 +266,7 @@ if $DO_METER; then
   METER_LOG_DIR_CFG="/var/log/govexy-meter"
   [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
     METER_LOG_DIR_CFG=$(grep -E '^METER_LOG_DIR=' "${SCRIPT_DIR}/govexy-node.conf" | head -1 \
-                        | cut -d= -f2- | tr -d '"' | awk '{print $1}')
+                        | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
   METER_LOG_DIR_CFG="${METER_LOG_DIR_CFG:-/var/log/govexy-meter}"
 
   # A node whose identity is not stable across reboots and reimages shares a
@@ -274,7 +343,10 @@ if $DO_SCHEDULER; then
   warn "Check the other node with:  bash 05-configure-workers.sh --status"
 fi
 
-read -r -p $'\nProceed? [y/N] ' answer
+# read returns non-zero at EOF, and under set -e that terminates the script
+# before die() is reached — a run under nohup exited 1 with a blank screen.
+read -r -p $'\nProceed? [y/N] ' answer \
+  || die "no terminal to confirm on (non-interactive run). Run it under tmux."
 [[ "$answer" == [yY] ]] || die "aborted"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,11 +369,22 @@ SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 MAILTO=""
 
-* * * * * ${APP_USER} cd ${APP_ROOT} && ${PHP_BIN} artisan schedule:run >> ${APP_ROOT}/storage/logs/scheduler.log 2>&1
+# '|| { ...; exit 1; }' rather than '&&': if APP_ROOT is unmounted or renamed
+# the cd fails, an && short-circuits, cron sees exit 0 and MAILTO="" swallows it
+# — so scheduled work stops with no trace anywhere. The echo matters as much as
+# the exit: a non-zero cron job with no output is still invisible unless someone
+# is watching /var/log/cron, and the log line says WHY.
+* * * * * ${APP_USER} cd ${APP_ROOT} || { echo "\$(date -Is) FATAL: cannot cd to ${APP_ROOT} — scheduled work is NOT running" >> ${APP_ROOT}/storage/logs/scheduler.log 2>/dev/null; exit 1; }; ${PHP_BIN} artisan schedule:run >> ${APP_ROOT}/storage/logs/scheduler.log 2>&1
 EOF
 
 chmod 644 "$CRON_FILE"
-install -o "$APP_USER" -g "$APP_GROUP" -m 0664 /dev/null "$APP_ROOT/storage/logs/scheduler.log" 2>/dev/null || true
+# Create it only if absent. `install ... /dev/null` TRUNCATES an existing file,
+# so re-running this stage threw away the scheduler history — including whatever
+# an operator was about to read to find out why a job stopped.
+if [[ ! -f "$APP_ROOT/storage/logs/scheduler.log" ]]; then
+  install -o "$APP_USER" -g "$APP_GROUP" -m 0664 /dev/null \
+    "$APP_ROOT/storage/logs/scheduler.log" 2>/dev/null || true
+fi
 
 cat > /etc/logrotate.d/govexy-scheduler <<EOF
 ${APP_ROOT}/storage/logs/scheduler.log {
@@ -327,8 +410,24 @@ log "Horizon"
 cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=GovExy Horizon queue supervisor
-After=network-online.target redis.service
+
+# NOT redis.service: Redis is remote on this estate, so there is no such unit
+# here and the ordering directive was silently inert.
+#
+# remote-fs.target plus RequiresMountsFor is the dependency that matters.
+# Queued jobs process media, form attachments and themes; a worker that starts
+# before the three binds land writes into the empty local directories
+# underneath them — the exact failure 03-mount-shared-storage.sh exists to
+# prevent for the deploy path, arriving by the queue instead.
+After=network-online.target remote-fs.target
 Wants=network-online.target
+RequiresMountsFor=${APP_ROOT}/storage/app/public ${APP_ROOT}/storage/app/private ${APP_ROOT}/resources/themes
+
+# Restart=always with RestartSec=5 does not trip systemd's default
+# StartLimitBurst=5 in a 10 s window — but that is true by arithmetic, not by
+# intent. Without this, a future RestartSec change plus a transient Redis outage
+# would leave Horizon permanently 'failed' with nothing processing the queue.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -358,12 +457,90 @@ SyslogIdentifier=govexy-horizon
 WantedBy=multi-user.target
 EOF
 
+# ── Mount-wait recovery ──────────────────────────────────────────────────────
+#
+# RequiresMountsFor= above is the right dependency and it has one sharp edge.
+# The fstab bind entries carry `nofail` (03-mount-shared-storage.sh), which is
+# deliberate — without it an NFS server that is down at boot drops the node to an
+# emergency console. But `nofail` means the mount units are allowed to be absent,
+# and RequiresMountsFor= on an absent mount makes Horizon fail its start job.
+# Once systemd has failed that job it does not retry: the NFS server comes back
+# ten minutes later, the mounts appear, and Horizon stays dead until a human
+# notices the queue is not draining.
+#
+# So the two settings need a third thing between them. This timer looks for all
+# three mounts once a minute and starts Horizon when they are all present. It is
+# a no-op whenever Horizon is already running, which is the normal case.
+#
+# A .path unit is the more obvious tool and the wrong one here: PathExists=
+# entries are OR-ed, and what has to be true is the AND of all three.
+#
+# Two escape hatches, because "starts Horizon whenever it is not running" would
+# otherwise fight an operator who stopped it on purpose — draining a node,
+# debugging a poison job — and win, once a minute:
+#
+#   systemctl disable govexy-horizon      permanent: is-enabled gates the timer
+#   touch /run/govexy-horizon.hold        for this boot only; clears on reboot
+#
+# --no-block so a Horizon that is slow to start does not hold the timer's own
+# start job open and trip TimeoutStartSec on the wrapper rather than on Horizon.
+cat > "$MOUNTWAIT_SERVICE" <<EOF
+[Unit]
+Description=Start GovExy Horizon once the shared mounts are present
+Documentation=man:systemd.mount(5)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'test -e /run/govexy-horizon.hold && exit 0; systemctl is-enabled --quiet govexy-horizon || exit 0; for m in ${APP_ROOT}/storage/app/public ${APP_ROOT}/storage/app/private ${APP_ROOT}/resources/themes; do findmnt -rn "\$m" >/dev/null 2>&1 || exit 0; done; systemctl is-active --quiet govexy-horizon && exit 0; systemctl reset-failed govexy-horizon 2>/dev/null || true; exec systemctl start --no-block govexy-horizon'
+EOF
+
+cat > "$MOUNTWAIT_TIMER" <<'EOF'
+[Unit]
+Description=Check for the GovExy shared mounts and start Horizon, every 60s
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=false
+Unit=govexy-horizon-mountwait.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
+
+# Horizon FIRST, then the timer — and the timer only once Horizon is confirmed
+# up. Enabling the recovery timer before knowing Horizon can start at all means
+# a genuinely broken unit (bad .env, no Redis) gets restarted every 60 seconds
+# forever, filling the journal and hiding the original failure behind a wall of
+# identical start attempts.
+# On a RE-RUN the mount-wait timer from a previous run is already active, and it
+# would start Horizon underneath the check below — making a unit that cannot
+# stay up look healthy for the three seconds this samples, or racing the enable
+# outright. Stop it for the duration; it is re-enabled once Horizon is
+# confirmed running, which is also what makes the failure message below true.
+systemctl disable --now govexy-horizon-mountwait.timer 2>/dev/null || true
+
 systemctl enable --now govexy-horizon
 sleep 3
 systemctl is-active --quiet govexy-horizon \
   && ok "Horizon running" \
-  || die "Horizon failed to start. Inspect:  journalctl -u govexy-horizon -n 50 --no-pager"
+  || die "Horizon failed to start. Inspect:  journalctl -u govexy-horizon -n 50 --no-pager
+
+       If the message mentions a dependency or a mount, check the three shared
+       paths are present — Horizon requires them:
+           findmnt ${APP_ROOT}/storage/app/public
+           findmnt ${APP_ROOT}/storage/app/private
+           findmnt ${APP_ROOT}/resources/themes
+
+       The mount-wait timer is NOT installed while Horizon cannot start, so it
+       is not masking anything here. Re-run this stage once the unit is healthy."
+
+systemctl enable --now govexy-horizon-mountwait.timer
+ok "mount-wait timer installed (recovers Horizon after an NFS outage at boot)"
+ok "    to stop it restarting Horizon: touch /run/govexy-horizon.hold"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,8 +552,12 @@ cat > "$METER_SERVICE" <<EOF
 [Unit]
 Description=GovExy edge bandwidth meter ingest (this node)
 Documentation=https://github.com/intcore-company/govexy-docs
-After=network-online.target nginx.service
+After=network-online.target remote-fs.target nginx.service
 Wants=network-online.target
+
+# Same reason as the Horizon unit: the ingest boots the framework, which reads
+# and writes under the shared paths.
+RequiresMountsFor=${APP_ROOT}/storage/app/public ${APP_ROOT}/storage/app/private ${APP_ROOT}/resources/themes
 
 # A run that fails FAST must not be mistaken for a run that never started. The
 # command records its own failure on the cursor row when it can reach the

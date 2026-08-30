@@ -98,6 +98,54 @@ if [[ -z "$LB_IPS" && "$RESTRICT_HTTP_TO_LB" == "yes" ]]; then
   die "RESTRICT_HTTP_TO_LB=yes requires LB_IPS. Set one or the other."
 fi
 
+# to_bytes is defined BEFORE it is used to derive the default below.
+#
+# 10#$n forces base 10: a conf carrying "0128M" would otherwise be read as octal
+# by $(( )) and silently become 88M.
+to_bytes() {
+  # tr rather than ${v^^}: that is a bash 4 feature and this has to keep working
+  # if the file is ever run under an older shell.
+  local v n
+  v=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+  n="${v%[KMG]}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { printf '0'; return; }
+  case "$v" in
+    *G) printf '%s' $(( 10#$n * 1024 * 1024 * 1024 )) ;;
+    *M) printf '%s' $(( 10#$n * 1024 * 1024 )) ;;
+    *K) printf '%s' $(( 10#$n * 1024 )) ;;
+    *)  printf '%s' $(( 10#$n )) ;;
+  esac
+}
+
+# post_max_size MUST exceed upload_max_filesize, and the assertion below is
+# strict — so the default cannot be PHP_UPLOAD_MAX itself. It was, which meant
+# every conf written before PHP_POST_MAX existed hard-failed stage 2 on an
+# upgrade. Derive a working value instead: the file plus 8M of multipart
+# overhead, which is far more than boundaries, field names and a CSRF token need.
+if [[ -z "${PHP_POST_MAX:-}" ]]; then
+  _u=$(to_bytes "$PHP_UPLOAD_MAX")
+  if (( _u > 0 )); then
+    PHP_POST_MAX="$(( _u / 1024 / 1024 + 8 ))M"
+  else
+    PHP_POST_MAX="$PHP_UPLOAD_MAX"
+  fi
+fi
+PHP_CLI_MEMORY_LIMIT="${PHP_CLI_MEMORY_LIMIT:-1024M}"
+
+_upload_b=$(to_bytes "$PHP_UPLOAD_MAX")
+_post_b=$(to_bytes "$PHP_POST_MAX")
+(( _upload_b > 0 && _post_b > 0 )) || \
+  die "PHP_UPLOAD_MAX ('${PHP_UPLOAD_MAX}') or PHP_POST_MAX ('${PHP_POST_MAX}') is not a
+       size like 128M. Use an integer with an optional K, M or G suffix."
+(( _post_b > _upload_b )) || \
+  die "PHP_POST_MAX (${PHP_POST_MAX}) must be GREATER than PHP_UPLOAD_MAX (${PHP_UPLOAD_MAX}).
+
+       A multipart body carrying a file of exactly PHP_UPLOAD_MAX is larger than
+       it once boundaries, field names and the CSRF token are counted. PHP then
+       discards the whole body and raises nothing: \$_POST and \$_FILES arrive
+       empty, Laravel sees no CSRF token and returns 419 — which reads as a
+       session problem, not a size one. Allow at least 8M of headroom."
+
 SECURITY_HEADERS="${SECURITY_HEADERS:-yes}"
 HSTS_MAX_AGE="${HSTS_MAX_AGE:-31536000}"
 HSTS_INCLUDE_SUBDOMAINS="${HSTS_INCLUDE_SUBDOMAINS:-yes}"
@@ -140,7 +188,10 @@ connect-src 'self'; worker-src 'self' blob:"
 
 log "Config: LB=[${LB_IPS:-<none yet>}]  REDIS=${REDIS_HOST}  APP_ROOT=${APP_ROOT}"
 log "        headers=${SECURITY_HEADERS}  frame=${FRAME_OPTIONS}  csp=${CSP_MODE}"
-read -r -p "Correct? [y/N] " confirm
+# read fails at EOF, and under set -e that used to kill the script before die()
+# ran — leaving an operator who used nohup with exit 1 and nothing on screen.
+read -r -p "Correct? [y/N] " confirm \
+  || die "no terminal to confirm on (non-interactive run). Run it under tmux."
 [[ "$confirm" == [yY] ]] || die "aborted"
 
 if [[ "$CSP_MODE" == "enforce" ]]; then
@@ -150,7 +201,8 @@ if [[ "$CSP_MODE" == "enforce" ]]; then
   warn "'self' for scripts and connections, so every one of those will be blocked on"
   warn "public tenant sites — silently, as a browser console error nobody watches."
   warn "Run report-only first unless those origins are already enumerated."
-  read -r -p "Continue with enforce? [y/N] " cspconfirm
+  read -r -p "Continue with enforce? [y/N] " cspconfirm \
+    || die "no terminal to confirm on (non-interactive run). Run it under tmux."
   [[ "$cspconfirm" == [yY] ]] || die "aborted"
 fi
 
@@ -190,9 +242,27 @@ request_terminate_timeout = 120s
 php_admin_value[error_log] = /var/log/php-fpm/www-error.log
 php_admin_flag[log_errors] = on
 
+; The WEB memory limit belongs here, not in /etc/php.d/99-govexy.ini, which the
+; CLI reads too. A web-sized ceiling there also caps artisan — Horizon workers,
+; schedule:run, metering:ingest-edge, theme:publish-assets and the content-bundle
+; importers all run under it.
+php_admin_value[memory_limit] = ${PHP_MEMORY_LIMIT}
+
+; Laravel does not use PHP's own session handler (SESSION_DRIVER=redis does the
+; work), so these only keep the stock directories valid for anything that asks.
 php_value[session.save_handler] = files
 php_value[session.save_path]    = /var/lib/php/session
 php_value[soap.wsdl_cache_dir]  = /var/lib/php/wsdlcache
+
+; RHEL's stock www.conf carries these, and this file is written from scratch.
+; php-fpm's clear_env defaults to ON, so without them the pool starts with an
+; EMPTY environment and every exec(), shell_exec() or Symfony Process call from
+; PHP fails with "command not found" — no PATH, no TMPDIR. Imagick is in-process
+; and unaffected; anything shelling out to gs, pdftoppm, unzip or git is not.
+env[PATH] = /usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+env[TMP] = /tmp
+env[TMPDIR] = /tmp
+env[TEMP] = /tmp
 EOF
 
 install -d -o root -g nginx -m 0770 /var/lib/php/session /var/lib/php/wsdlcache
@@ -201,10 +271,18 @@ install -d -o root -g nginx -m 0770 /var/lib/php/session /var/lib/php/wsdlcache
 log "2/6  PHP runtime settings"
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Read by BOTH SAPIs. The web memory limit is deliberately absent — it is set on
+# the FPM pool instead, so it cannot cap artisan. What is here is the CLI's own
+# limit, which needs to be the larger of the two.
 cat > /etc/php.d/99-govexy.ini <<EOF
-memory_limit = ${PHP_MEMORY_LIMIT}
+memory_limit = ${PHP_CLI_MEMORY_LIMIT}
 upload_max_filesize = ${PHP_UPLOAD_MAX}
-post_max_size = ${PHP_UPLOAD_MAX}
+
+; Must exceed upload_max_filesize: a multipart body carrying a file of exactly
+; upload_max_filesize is larger than it once boundaries and fields are counted,
+; and PHP silently discards the entire body when this is exceeded — the request
+; arrives with no CSRF token and Laravel answers 419.
+post_max_size = ${PHP_POST_MAX}
 max_execution_time = 60
 expose_php = Off
 date.timezone = ${SERVER_TZ}
@@ -299,7 +377,22 @@ rm -f /etc/nginx/conf.d/default.conf
 # valid here and nginx.conf needs no further editing.
 {
   echo "server_tokens off;"
-  echo "client_max_body_size ${PHP_UPLOAD_MAX};"
+  # Follows post_max_size, not upload_max_filesize: nginx must not reject a
+  # multipart body that PHP would have accepted.
+  echo "client_max_body_size ${PHP_POST_MAX};"
+  echo
+  # HTTPS for FastCGI. NOT $http_x_forwarded_proto directly.
+  #
+  # Symfony's Request::isSecure() is !empty($https) && 'off' !== strtolower($https),
+  # so a plaintext request arriving with "X-Forwarded-Proto: http" set HTTPS=http
+  # — non-empty, not "off" — and the framework treated it as SECURE. Only a
+  # request with no XFP header at all was correctly seen as insecure.
+  #
+  # An empty value is what makes PHP see no HTTPS at all, which is the intent.
+  echo 'map $http_x_forwarded_proto $govexy_https {'
+  echo '    default "";'
+  echo '    "https"  "on";'
+  echo '}'
   echo
   echo 'log_format main_lb '"'"'\$remote_addr - \$remote_user [\$time_local] "\$request" '"'"''
   echo '                   '"'"'\$status \$body_bytes_sent "\$http_referer" '"'"''
@@ -458,7 +551,10 @@ ${METER_ACCESS_LOG}
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         fastcgi_param PATH_INFO \$fastcgi_path_info;
-        fastcgi_param HTTPS \$http_x_forwarded_proto;
+        # "on" only when the load balancer says https, empty otherwise. See the
+        # \$govexy_https map in 00-govexy-http.conf for why the raw header
+        # cannot be passed through here.
+        fastcgi_param HTTPS \$govexy_https;
 
         # Overwrite the client-supplied X-Forwarded-For with the address nginx
         # actually resolved. The application trusts proxies at '*', so without
@@ -483,9 +579,14 @@ ${METER_ACCESS_LOG}
         # \$host is what nginx matched the request on, not what the client asserted.
         fastcgi_param HTTP_X_FORWARDED_HOST \$host;
 
-        # X-Forwarded-Proto is trusted the same way and decides whether the
-        # framework thinks the request was secure. Pin it to what the load
-        # balancer actually terminated rather than to a client claim.
+        # X-Forwarded-Proto, passed through as the client sent it — unlike XFF
+        # and XFH above, which are pinned to values nginx established.
+        #
+        # It is NOT pinned, and this comment used to claim it was. With
+        # RESTRICT_HTTP_TO_LB="no" anyone who can reach :80 directly can assert
+        # "https" here. The impact is bounded — a forged URL scheme and secure
+        # cookie flags, not authentication — but it is a claim the config does
+        # not make good on. Restrict :80 to the load balancer to close it.
         fastcgi_param HTTP_X_FORWARDED_PROTO \$http_x_forwarded_proto;
         fastcgi_hide_header X-Powered-By;
         fastcgi_read_timeout 60s;
@@ -496,6 +597,13 @@ ${METER_ACCESS_LOG}
 
     # Nothing else may execute PHP.
     location ~ \.php\$ { return 404; }
+
+    # Defence in depth. Both are gated in the application, and 04-deploy.sh
+    # refuses to deploy unless TELESCOPE_ENABLED=false, but neither has any
+    # business being reachable on a government node. /horizon is deliberately
+    # NOT here: it is the operator's queue dashboard (see 05-configure-workers.sh).
+    location ^~ /telescope { return 404; }
+    location ^~ /pulse     { return 404; }
 
     # Dotfiles stay private, except .well-known, which the application serves
     # through index.php (tenant-managed verification files, ACME challenges).
@@ -585,6 +693,12 @@ ${METER_ACCESS_LOG}
 EOF
 
 nginx -t
+
+# The theme-dist location serves the .gz written at publish time. Checked the
+# same way realip is checked in stage 1: a missing module is silent, and the
+# symptom is that compression is paid per response instead of per build.
+nginx -V 2>&1 | tr ' ' '\n' | grep -q 'gzip_static' || \
+  warn "nginx built without http_gzip_static_module — theme-dist .gz files will not be served"
 
 # ── Meter log rotation ───────────────────────────────────────────────────────
 #
@@ -731,7 +845,11 @@ if [[ "$METER_LOG" == "yes" ]]; then
     tail -1 "${METER_LOG_DIR}/meter.log"
     stat -c '  %n  %U:%G %a' "${METER_LOG_DIR}/meter.log"
 
-    if ! sudo -u nginx test -r "${METER_LOG_DIR}/meter.log"; then
+    # Derived from the application root's owner, like everything else in this
+    # repository — the reader is the app user, which is only coincidentally
+    # nginx today.
+    METER_READER=$(stat -c '%U' "$APP_ROOT" 2>/dev/null || echo nginx)
+    if ! sudo -u "$METER_READER" test -r "${METER_LOG_DIR}/meter.log"; then
       warn "the application user cannot READ the meter log — ingest would report zero bytes forever"
     fi
   else
@@ -769,7 +887,11 @@ Remaining, per node:
          REDIS_CLIENT=phpredis
          REDIS_HOST=<redis server>
          DB_HOST=<mysql server>
-  4. chown -R nginx:nginx storage bootstrap/cache && restorecon -R <APP_ROOT>
+  4. Ownership: 04-deploy.sh does this per deploy, and does it correctly —
+     it prunes the three NFS binds. Do NOT run a bare
+     `chown -R nginx:nginx storage`: it descends into storage/app/public and
+     storage/app/private, which are the shared media and attachment exports,
+     and root_squash refuses it file by file in silence.
   5. php artisan config:cache route:cache view:cache
      systemctl reload php-fpm
 

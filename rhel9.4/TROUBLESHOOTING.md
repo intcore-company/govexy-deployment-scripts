@@ -26,17 +26,19 @@ sudo bash 01-install-dependencies.sh 2>&1 | tee /root/govexy-stage1.log
 
 Detach with `Ctrl-b d`, reattach with `tmux attach -t govexy`.
 
-**Do not use `nohup` or `&`.** `02-configure-nginx-php.sh` stops at a confirmation
-prompt:
+**Do not use `nohup` or `&`.** `02-configure-nginx-php.sh`, `03-mount-shared-storage.sh`,
+`04-deploy.sh` and `05-configure-workers.sh` all stop at a confirmation prompt:
 
 ```
 ==> Config: LB=[<none yet>]  REDIS=10.32.46.95  APP_ROOT=/var/www/govexy
 Correct? [y/N]
 ```
 
-With stdin detached that read returns empty, the script takes the `N` branch and
-exits with `[fail] aborted` — after having done nothing. tmux keeps the terminal,
-so the prompt works.
+With stdin detached, `read` hits EOF and returns **non-zero**, and under `set -e`
+that terminated the script *before* the `[fail] aborted` message — so what an
+operator actually saw was **exit 1 and a blank screen**, not the `N` branch. The
+scripts now print "no terminal to confirm on (non-interactive run)" instead, but
+the fix is the same: tmux keeps the terminal, so the prompt works.
 
 ### Where the logs are
 
@@ -50,7 +52,9 @@ so the prompt works.
 
 ### Re-running is safe
 
-Both scripts are idempotent by design and are meant to be re-run after a fix:
+Stages 1, 2, 3 and 5 are idempotent by design and are meant to be re-run after a
+fix. Stage 4 (the deploy) is idempotent for a clean re-run; see
+[issue 11](#11-a-deploy-failed-part-way) for resuming a partial failure.
 
 - Stage 1 guards installs with `rpm -q` / `command -v`, backs up each Remi repo
   file once to `<file>.bak`, and rewrites `/etc/dnf/dnf.conf` keys in place
@@ -624,6 +628,160 @@ systemctl show php-fpm -p ExecMainStartTimestamp
 The real check is a request: hit a route touched by the deploy through nginx (not
 the CLI — `opcache.enable_cli = 0`, so the CLI never shows this problem and is
 useless as a test) and confirm the new behaviour.
+
+---
+
+## 11. A deploy failed part way
+
+**Symptom**
+
+`04-deploy.sh` exited non-zero. What the node is serving depends on where it
+stopped, and the script says so at each stage — read its last lines before
+touching anything.
+
+**The node is stuck in maintenance mode (`/up` returns 503)**
+
+The `EXIT` trap is supposed to prevent this: on any non-zero exit it clears the
+compiled caches (`config:clear route:clear view:clear event:clear`, never
+`optimize:clear` — that flushes the Redis store the other node shares) and runs
+`artisan up`. If the trap itself could not run — SIGKILL, the node rebooted —
+lift it by hand:
+
+```bash
+sudo -u nginx php /var/www/govexy/artisan up
+```
+
+If that returns but `/up` is still 503, the cache set is half built. Clear the
+four and try again:
+
+```bash
+for c in config:clear route:clear view:clear event:clear; do
+  sudo -u nginx php /var/www/govexy/artisan $c
+done
+sudo -u nginx php /var/www/govexy/artisan up
+```
+
+**The test gate failed for environmental reasons, not code**
+
+Look for a whole class failing at once rather than a handful. The gate runs under
+`env -i` with `DB_CONNECTION=sqlite`, `DB_DATABASE=:memory:`,
+`FILESYSTEM_DISK=testing` and `APP_MAINTENANCE_DRIVER=cache` set explicitly, so
+the usual environmental causes are already closed. What is left:
+
+| Signature | Cause |
+|---|---|
+| hundreds of HTTP tests returning 503 | the release predates the `APP_MAINTENANCE_DRIVER=cache` pin in `phpunit.xml` (cms < 1.4.24). The script refuses to start rather than produce this — if you see it, the guard was bypassed. |
+| every billing/licence test failing | the suite pins `LICENSE_MODE=saas` while this node runs `onprem`. Expected, and warned about before the run. A green gate does not prove the on-premise build works. |
+| `could not find driver` | `pdo_sqlite` missing — `dnf -y install php-pdo`. Stage 1 asserts it. |
+| the runner never produced a `Tests:` line | it crashed or never started; read the top of `storage/logs/deploy-tests-*.log`. |
+
+Re-run with `--skip-tests` once you have established the failure is not the code,
+and say why in the change record.
+
+**`/up` is not 200 after the deploy**
+
+The script exits non-zero for this, deliberately: **do not deploy the next node.**
+One broken node is an incident; two is an outage.
+
+```bash
+tail -50 /var/www/govexy/storage/logs/laravel-$(date +%Y-%m-%d).log
+tail -30 /var/log/nginx/govexy-error.log
+tail -30 /var/log/php-fpm/www-error.log
+```
+
+Roll back by redeploying the previous tag — see "Rollback" in `README.md`. Do
+**not** use `git reset --hard`.
+
+**"N migrations are still pending" on a non-primary node**
+
+Working as intended. The primary has not deployed this release yet, and caching
+new code against the old schema produces errors until it does. Deploy the primary
+first:
+
+```bash
+bash 04-deploy.sh --ref <tag> --primary
+```
+
+**"the primary node deployed X, this node was given Y"**
+
+The primary recorded its ref at `storage/app/private/.deployed-ref` on the shared
+export and they disagree — someone pushed or re-tagged between the two nodes.
+Deploy the ref the primary actually ran, or redeploy the primary with the one you
+want.
+
+**Horizon is dead after a reboot and will not come back**
+
+The one interaction between two settings that are each individually right. The
+fstab bind entries carry `nofail`, so a node whose NFS server is down still
+boots (without it, it drops to an emergency console). `govexy-horizon.service`
+carries `RequiresMountsFor=` the three shared paths, so a worker never starts
+against empty local directories. Put together: if the mounts are absent at boot,
+Horizon's start job **fails**, and systemd does not retry a failed start job. The
+NFS server comes back, the mounts appear, and Horizon stays dead — the queue
+simply stops draining, with nothing in the application logs.
+
+```bash
+bash 05-configure-workers.sh --status     # names this case explicitly
+systemctl status govexy-horizon
+findmnt /var/www/govexy/storage/app/public
+```
+
+`govexy-horizon-mountwait.timer` exists to close this: it checks all three mounts
+once a minute and starts Horizon when they are present. Confirm it is running —
+a node provisioned before it existed will not have it, and needs
+`bash 05-configure-workers.sh --horizon` once.
+
+```bash
+systemctl is-active govexy-horizon-mountwait.timer
+```
+
+To recover by hand:
+
+```bash
+mount -a
+systemctl start govexy-horizon
+```
+
+`reset-failed` is only needed if the unit is genuinely in the `failed` state —
+which here means it hit the start rate limit, not that a dependency was missing.
+An unsatisfied `RequiresMountsFor=` leaves the unit **inactive**, and `start`
+works on it directly once the mounts are there. Check before reaching for it:
+
+```bash
+systemctl is-failed govexy-horizon     # "failed" -> reset-failed first
+systemctl reset-failed govexy-horizon
+```
+
+**Stopping the timer from restarting Horizon**
+
+The timer exists to fight an accidental stop, so it will also fight a deliberate
+one — draining a node, or holding the queue while you debug a poison job. Two
+ways to tell it not to:
+
+```bash
+touch /run/govexy-horizon.hold     # this boot only; /run is cleared on reboot
+systemctl disable govexy-horizon   # permanent, survives reboot
+```
+
+The timer skips when either is true, so `systemctl stop govexy-horizon` alone is
+not enough — it will be restarted within the minute.
+
+**`resources/themes` is still tracked in git**
+
+A warning, not a failure, and it is the one hazard in this repository that the
+scripts cannot fix on their own. `resources/themes` is both tracked and an NFS
+bind mount, so a checkout touching a tracked path under it writes onto the shared
+export — visible to the other node before that node has deployed — and any
+`git reset --hard` restores shipped themes over admin-uploaded ones. Untrack it in
+the application repository:
+
+```bash
+git rm -r --cached resources/themes
+```
+
+and add `/resources/themes/*` plus `!/resources/themes/.gitkeep` to `.gitignore`.
+See the closing notes of `03-mount-shared-storage.sh` for the test-fixture move
+that has to happen in the same change.
 
 ---
 
