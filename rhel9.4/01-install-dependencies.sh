@@ -38,10 +38,15 @@ die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 grep -qi 'release 9' /etc/redhat-release 2>/dev/null || die "expected RHEL 9.x"
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "1/7  Base system"
+log "1/8  Base system"
 # ═════════════════════════════════════════════════════════════════════════════
 
-[[ -n "$NODE_HOSTNAME" ]] && hostnamectl set-hostname "$NODE_HOSTNAME"
+# if/fi rather than `[[ ... ]] && hostnamectl`: the && form is only safe under
+# set -e because it is not the last command in the script, which is a property
+# of where it sits rather than of what it does.
+if [[ -n "$NODE_HOSTNAME" ]]; then
+  hostnamectl set-hostname "$NODE_HOSTNAME"
+fi
 timedatectl set-timezone "$SERVER_TZ"
 
 subscription-manager repos --enable codeready-builder-for-rhel-9-x86_64-rpms || \
@@ -50,12 +55,19 @@ subscription-manager repos --enable codeready-builder-for-rhel-9-x86_64-rpms || 
 rpm -q epel-release &>/dev/null || \
   dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
 
+# cronie:     05-configure-workers.sh writes /etc/cron.d/govexy-scheduler and
+#             restarts crond under set -e. On a minimal RHEL 9 install cronie is
+#             absent, so that stage died leaving a node that looks configured and
+#             runs no scheduled work at all.
+# logrotate:  both 02 (meter log) and 05 (scheduler log) install fragments.
+# nfs-utils:  the client side of the three shared mounts in stage 3, and nfsstat
+#             for nfs-latency-check.sh.
 dnf -y install dnf-plugins-core policycoreutils-python-utils firewalld chrony \
-               vim unzip tar git curl
-systemctl enable --now chronyd firewalld
+               vim unzip tar git curl cronie logrotate nfs-utils
+systemctl enable --now chronyd firewalld crond
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "2/7  dnf tolerance for a slow / inspected link"
+log "2/8  dnf tolerance for a slow / inspected link"
 # ═════════════════════════════════════════════════════════════════════════════
 
 # minrate defaults to 1000 B/s. Through this proxy that threshold is what
@@ -70,7 +82,7 @@ for kv in "timeout=300" "minrate=100" "retries=10"; do
 done
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "3/7  nginx"
+log "3/8  nginx"
 # ═════════════════════════════════════════════════════════════════════════════
 
 dnf -y install nginx
@@ -80,7 +92,7 @@ nginx -V 2>&1 | tr ' ' '\n' | grep -q 'realip' || \
 # Not started here. Stage 2 writes the vhost, then starts it.
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "4/7  Remi repository (HTTPS baseurl, mirrorlist disabled)"
+log "4/8  Remi repository (HTTPS baseurl, mirrorlist disabled)"
 # ═════════════════════════════════════════════════════════════════════════════
 
 rpm -q remi-release &>/dev/null || \
@@ -106,7 +118,7 @@ dnf clean all
 dnf makecache
 
 # ═════════════════════════════════════════════════════════════════════════════
-log "5/7  PHP 8.4"
+log "5/8  PHP 8.4"
 # ═════════════════════════════════════════════════════════════════════════════
 
 # RHEL 9 AppStream tops out at PHP 8.3; this application requires ^8.4.
@@ -114,6 +126,12 @@ dnf -y module reset php
 dnf -y module enable php:remi-8.4
 dnf module list php | grep -q 'remi-8.4 \[e\]' || die "php:remi-8.4 stream not enabled"
 
+# php-pdo is what carries pdo_sqlite.so and sqlite3.so on Remi/Fedora packaging —
+# there is no separate php-sqlite package on this platform. The deploy gate
+# (04-deploy.sh) hard-requires pdo_sqlite, because phpunit.xml pins the suite to
+# sqlite/:memory: and that pin is the only reason running the suite on a live
+# node is acceptable. Both are asserted in the verification step below rather
+# than left to surface at deploy time on a production node.
 PHP_PKGS=(
   php-cli php-fpm php-common php-mbstring php-xml php-gd php-intl
   php-bcmath php-opcache php-mysqlnd php-pdo php-sodium php-process
@@ -165,12 +183,28 @@ log "8/8  Verification"
 
 php -v | head -1 | grep -q 'PHP 8\.4' || die "PHP 8.4 is not the active version"
 
+# Two lists, because a warning at the end of a long unattended stage 1 is
+# scrolled past and the consequence surfaces on a production node at deploy time.
+#
+# pdo_sqlite and sqlite3 are in the required list even though nothing in the
+# running application uses them: the deploy gate runs the Pest suite against
+# sqlite/:memory:, and 04-deploy.sh refuses to run without them.
 missing=()
 for ext in curl fileinfo intl mbstring redis sodium zip pcntl posix pdo_mysql \
-           gd bcmath openssl tokenizer dom xmlwriter exif; do
+           pdo_sqlite sqlite3 gd bcmath openssl tokenizer dom xmlwriter; do
   php -m | grep -qix "$ext" || missing+=("$ext")
 done
-(( ${#missing[@]} == 0 )) || warn "extensions missing: ${missing[*]}"
+(( ${#missing[@]} == 0 )) || die "required PHP extensions missing: ${missing[*]}
+
+       The application (or the deploy gate) cannot run without these. Check
+       which package provides each:  dnf provides '*/${missing[0]}.so'"
+
+optional_missing=()
+for ext in exif imagick; do
+  php -m | grep -qix "$ext" || optional_missing+=("$ext")
+done
+(( ${#optional_missing[@]} == 0 )) || \
+  warn "optional extensions missing: ${optional_missing[*]} (image orientation and PDF thumbnails)"
 
 printf '\n'
 php -v | head -1

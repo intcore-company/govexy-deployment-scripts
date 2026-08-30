@@ -639,7 +639,7 @@ if $DO_TESTS; then
 
     php -m | grep -qix pdo_sqlite || \
       die "pdo_sqlite extension is missing — the suite cannot run.
-       Install it:  dnf -y install php-pdo php-sqlite
+       Install it:  dnf -y install php-pdo   (it carries pdo_sqlite.so)
        (01-install-dependencies.sh installs and verifies both.)"
 
     # PHPUnit's <env> elements do NOT overwrite a variable that already exists
