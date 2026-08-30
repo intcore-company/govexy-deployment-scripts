@@ -124,6 +124,11 @@ APP_ROOT="/var/www/govexy"
   APP_ROOT=$(grep -E '^APP_ROOT=' "${SCRIPT_DIR}/govexy-node.conf" | head -1 \
              | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
 APP_ROOT="${APP_ROOT:-/var/www/govexy}"
+# A trailing slash in the conf turns every "$APP_ROOT/storage/..." into a path
+# with a doubled slash. Harmless to the kernel, but the -path -prune clauses in
+# the find sweeps compare strings, and "/var/www/govexy//storage/app/public"
+# never matches what find walks.
+APP_ROOT="${APP_ROOT%/}"
 
 # A DO_TESTS setting in govexy-node.conf becomes the site-wide default; an
 # explicit --with-tests / --skip-tests on the command line still wins.
@@ -136,6 +141,32 @@ if ! $TESTS_EXPLICIT && [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]]; then
   conf_tests=$(grep -E '^DO_TESTS=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
                | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
   [[ "$conf_tests" == "false" ]] && DO_TESTS=false
+fi
+
+# --primary must agree with NODE_ROLE. They are two statements of the same fact
+# and the failure modes of a disagreement are both bad: --primary on a secondary
+# migrates from the wrong node, and omitting it on the primary means nobody
+# migrates and every node then refuses on pending migrations.
+if [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]]; then
+  conf_role=$(grep -E '^NODE_ROLE=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
+              | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
+  conf_role="${conf_role:-secondary}"
+
+  if $PRIMARY && [[ "$conf_role" != "primary" ]]; then
+    die "--primary was given, but NODE_ROLE is '${conf_role}' in govexy-node.conf.
+
+       Migrations belong to exactly one node and this file says it is not this
+       one. Either drop --primary here, or fix NODE_ROLE if this really is the
+       primary — but check the other node is not also claiming it."
+  fi
+  if ! $PRIMARY && [[ "$conf_role" == "primary" ]]; then
+    die "NODE_ROLE=primary in govexy-node.conf, but --primary was not given.
+
+       This is the node that runs migrations. Without it nothing migrates, and
+       every node — including this one — then refuses to deploy on pending
+       migrations.
+           bash 04-deploy.sh --ref ${DEPLOY_REF:-<tag>} --primary"
+  fi
 fi
 
 [[ -d "$APP_ROOT" ]] || die "application root not found: $APP_ROOT"
@@ -222,14 +253,28 @@ write_shared_marker() {
     return 0
   fi
 
-  if sudo -u "$APP_USER" sh -c '
-        umask 027
+  # umask 022, not 027. These are markers, not secrets — they hold a git tag and
+  # a truncated digest — and 0640 made them unreadable to the OTHER node's
+  # reader, which is the entire point of writing them. Root reads as `nobody`
+  # under root_squash, so a group-restricted file silently defeated the check it
+  # exists to perform.
+  #
+  # rm -f the temp file on failure: a partial write left ".deployed-ref.tmp.NNN"
+  # littering the shared export, one per failed deploy, forever.
+  local err
+  if err=$(sudo -u "$APP_USER" sh -c '
+        umask 022
         tmp="$2.tmp.$$"
-        printf "%s\n" "$1" > "$tmp" && mv -f "$tmp" "$2"
-      ' sh "$value" "$path" 2>/dev/null; then
+        if printf "%s\n" "$1" > "$tmp" && mv -f "$tmp" "$2"; then
+          exit 0
+        fi
+        rm -f "$tmp" 2>/dev/null
+        exit 1
+      ' sh "$value" "$path" 2>&1); then
     ok "recorded ${label}: ${value}"
   else
     warn "could not write ${path} as ${APP_USER}."
+    [[ -n "$err" ]] && warn "    ${err}"
     warn "${label} is NOT recorded, so cross-node checking is OFF for this release."
     warn "Check that ${APP_USER} can write the shared export — root cannot, under"
     warn "the root_squash that NFS-SHARED-STORAGE.md recommends."
@@ -272,6 +317,15 @@ MAINT_ON=false
 # carrying the NEW release against the OLD schema, so lifting maintenance is a
 # decision rather than a courtesy.
 CODE_SWAPPED=false
+# Set once composer has installed dev dependencies, so cleanup() knows whether
+# there is anything to strip. Stripping unconditionally re-ran composer on a
+# node whose vendor/ was already --no-dev, for no reason and inside the window.
+DEV_DEPS_INSTALLED=false
+# Set once Vite has run. This is the one that actually makes a node unservable:
+# emptyOutDir deletes the OLD hashed assets, so every already-served page 404s
+# even if the PHP is unchanged. It can be true with CODE_SWAPPED false, on a
+# --no-pull deploy.
+ASSETS_REBUILT=false
 # Set once migrations have run. Code swapped + migrated is a consistent node;
 # code swapped + not migrated is not.
 MIGRATED=false
@@ -282,8 +336,38 @@ MIGRATED=false
 cleanup() {
   local status=$?
   (( status == 0 )) && return 0
-  $MAINT_ON || return 0
   $DRY_RUN && return 0
+
+  # The gap this closes: CODE_SWAPPED is set by the checkout in step 2, but
+  # MAINT_ON only in step 3. Every die() in between — the ref mismatch, the
+  # three migrate:status refusals, the phpunit pin, the `down` assertion itself
+  # — used to return here on `! $MAINT_ON` and say nothing at all, leaving a
+  # node SERVING, in the load balancer, on the new source tree with the previous
+  # release's vendor/ and cached config. Silently. That is worse than the
+  # failure that produced it, and it is the one state nobody would think to
+  # check for.
+  if ! $MAINT_ON; then
+    if $CODE_SWAPPED || $ASSETS_REBUILT; then
+      warn ""
+      warn "═══════════════════════════════════════════════════════════════════"
+      warn "THIS NODE IS STILL SERVING, AND IT IS NOW INCONSISTENT."
+      warn "═══════════════════════════════════════════════════════════════════"
+      warn ""
+      warn "The deploy stopped (exit ${status}) after the working tree changed but"
+      warn "before maintenance mode was entered, so the node never left the load"
+      warn "balancer. It is answering requests with:"
+      $CODE_SWAPPED   && warn "  - the ${DEPLOY_REF:-new} source tree, against the PREVIOUS release's"
+      $CODE_SWAPPED   && warn "    vendor/ and cached config;"
+      $ASSETS_REBUILT && warn "  - a rebuilt public/build, so every asset URL already handed out is a 404."
+      warn ""
+      warn "Take it out of the load balancer now, then either finish the deploy"
+      warn "or go back to the release that was running:"
+      warn "    sudo -u $APP_USER php $APP_ROOT/artisan down --render='errors::503'"
+      warn "    bash 04-deploy.sh --ref <previous-tag> --skip-tests"
+      warn ""
+    fi
+    return 0
+  fi
 
   # Step 9 builds config, route, view and event caches as four separate gates.
   # A failure at the second one used to lift maintenance onto a NEW cached
@@ -305,13 +389,27 @@ cleanup() {
   # to real traffic — worse than staying dark, and harder to notice. It also
   # used to serve with dev dependencies installed, since the gate runs before
   # they are stripped.
-  if $CODE_SWAPPED && ! $MIGRATED; then
+  # ASSETS_REBUILT as well as CODE_SWAPPED: a --no-pull deploy never checks
+  # anything out, so CODE_SWAPPED stays false, but Vite has still emptied
+  # public/build and the old hashed assets are gone. Coming back up in that
+  # state serves a site with no CSS.
+  if { $CODE_SWAPPED || $ASSETS_REBUILT; } && ! $MIGRATED; then
     warn ""
     warn "LEAVING THIS NODE IN MAINTENANCE MODE, deliberately."
     warn ""
-    warn "The working tree is now ${DEPLOY_REF:-the new release} but its migrations"
-    warn "have NOT run. Lifting maintenance would serve new code against the old"
-    warn "schema. This node stays out of the load balancer until you decide."
+    # Say which of the two actually happened. A --no-pull deploy checks nothing
+    # out, so claiming "the working tree is now <tag>" there would be false, and
+    # a message that is wrong about the cause is worse than no message.
+    if $CODE_SWAPPED; then
+      warn "The working tree is now ${DEPLOY_REF:-the new release} but its migrations"
+      warn "have NOT run. Lifting maintenance would serve new code against the old"
+      warn "schema. This node stays out of the load balancer until you decide."
+    else
+      warn "public/build has been rebuilt — Vite empties it, so the previously"
+      warn "served hashed assets are gone — and migrations have NOT run. Lifting"
+      warn "maintenance would serve a site with no CSS. This node stays out of the"
+      warn "load balancer until you decide."
+    fi
     warn ""
     warn "Either finish the deploy:"
     # PRIMARY holds the strings "true"/"false", so ${PRIMARY:+...} would always
@@ -332,7 +430,10 @@ cleanup() {
   # Safe to come back up. Strip dev dependencies first: the gate installs them,
   # and a failure between the gate and step 6's cleanup would otherwise leave
   # Pest, PHPUnit and the factories on a serving node.
-  if $CODE_SWAPPED && $DO_COMPOSER; then
+  # Only when composer actually installed them. Unconditionally re-running
+  # composer here punished a --skip-composer or already---no-dev node with a
+  # full dependency resolve inside the maintenance window for nothing.
+  if $DEV_DEPS_INSTALLED; then
     warn "removing dev dependencies before lifting maintenance"
     sudo -u "$APP_USER" env HOME="$APP_HOME" \
       COMPOSER_HOME="$COMPOSER_CACHE" COMPOSER_CACHE_DIR="$COMPOSER_CACHE/cache" \
@@ -435,8 +536,13 @@ if ! $DRY_RUN; then
   # only the digest travels, never a value.
   ENV_FINGERPRINT=$(grep -vE '^\s*(#|$)' "$APP_ROOT/.env" | sort | sha256sum | cut -c1-16)
   printf 'env fp    : %s   (must match on every node)\n' "$ENV_FINGERPRINT"
-  if [[ -r "$ENV_FINGERPRINT_FILE" ]]; then
-    recorded=$(head -1 "$ENV_FINGERPRINT_FILE" | awk '{print $1}')
+  # Read as the app user, not with [[ -r ]]. This script is root, and root is
+  # `nobody` on a root_squash export — so the test failed on a marker that was
+  # present and readable by everyone who mattered, and the comparison below was
+  # silently skipped on every deploy.
+  recorded=$(sudo -u "$APP_USER" head -1 "$ENV_FINGERPRINT_FILE" 2>/dev/null \
+             | awk '{print $1}' || true)
+  if [[ -n "$recorded" ]]; then
     [[ "$recorded" == "$ENV_FINGERPRINT" ]] || \
       warn ".env differs from the fingerprint the primary recorded (${recorded}).
        Reconcile the two files before this node serves traffic."
@@ -617,8 +723,10 @@ fi
 if ! $DRY_RUN && [[ -n "$DEPLOY_REF" ]]; then
   if $PRIMARY; then
     write_shared_marker "$DEPLOYED_REF_FILE" "$DEPLOY_REF" "deployed ref"
-  elif [[ -r "$DEPLOYED_REF_FILE" ]]; then
-    primary_ref=$(head -1 "$DEPLOYED_REF_FILE" | awk '{print $1}')
+  elif primary_ref=$(sudo -u "$APP_USER" head -1 "$DEPLOYED_REF_FILE" 2>/dev/null \
+                     | awk '{print $1}') && [[ -n "$primary_ref" ]]; then
+    # As the app user, for the same reason as the fingerprint above: root is
+    # `nobody` here, so [[ -r ]] said "absent" for a file that was plainly there.
     [[ "$primary_ref" == "$DEPLOY_REF" ]] || \
       die "the primary node deployed '${primary_ref}', this node was given '${DEPLOY_REF}'.
 
@@ -658,7 +766,10 @@ $(printf '%s\n' "$migrate_status" | sed 's/^/       /')
        Cannot tell whether the primary has deployed this release. Fix the
        database connection or the boot failure above before deploying."
 
-  grep -qE 'Ran|Pending' <<<"$migrate_status" || die "migrate:status returned no migration rows:
+  # Anchored on the batch column that only a real status table has. Bare
+  # 'Ran|Pending' matched any prose containing those words — including a
+  # deprecation notice or an exception message mentioning "Pending".
+  grep -qE '\[[0-9]+\] Ran|Pending' <<<"$migrate_status" || die "migrate:status returned no migration rows:
 
 $(printf '%s\n' "$migrate_status" | sed 's/^/       /')
 
@@ -727,14 +838,45 @@ MAINT_SECRET=$(openssl rand -hex 16 2>/dev/null || true)
 
 as_app "php '$APP_ROOT/artisan' down --render='errors::503' --retry=60 --secret='$MAINT_SECRET' || true"
 
+# Set BEFORE the verification below, not after. `down` can half-succeed — write
+# its flag and then fatal — and if the verification then dies with MAINT_ON
+# still false, cleanup() has no idea the node is dark and nothing ever lifts it.
+# Assume it took, then prove it; the trap can always lift a node that was never
+# down, and cannot lift one it does not know about.
+MAINT_ON=true
+
 # `|| true` above keeps a fatal from aborting the deploy, which is right — but
-# it also used to let MAINT_ON=true stand on a node that never went down. A new
-# tag against an old vendor/ is exactly when `down` fatals, and that is exactly
-# when the node must NOT stay in the load balancer while composer and Vite
-# rewrite it underneath. Verify the flag file rather than the exit code.
+# it also used to let this stand on a node that never went down. A new tag
+# against an old vendor/ is exactly when `down` fatals, and that is exactly when
+# the node must NOT stay in the load balancer while composer and Vite rewrite it
+# underneath. So verify, rather than trusting the exit code.
+#
+# HOW to verify depends on the driver, and checking the file unconditionally was
+# wrong: with APP_MAINTENANCE_DRIVER=cache the flag lives in Redis and
+# storage/framework/down is never written, so a correctly configured node failed
+# this check and was told it was still live.
 if ! $DRY_RUN; then
-  [[ -f "$APP_ROOT/storage/framework/down" ]] || \
-    die "artisan down did not take effect — this node is STILL IN THE LOAD BALANCER.
+  maint_driver=$(env_value APP_MAINTENANCE_DRIVER)
+  maint_driver="${maint_driver:-file}"
+
+  if [[ "$maint_driver" == "file" ]]; then
+    maint_ok=false
+    [[ -f "$APP_ROOT/storage/framework/down" ]] && maint_ok=true
+    maint_how="storage/framework/down is absent"
+  else
+    # Any non-file driver (cache, and whatever else a release adds): ask the
+    # node what it is actually serving. /up is the load balancer's own health
+    # check, so a 503 here is precisely "the LB will drain me".
+    maint_code=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 20 \
+      -H "Host: $(hostname -f 2>/dev/null || hostname)" http://127.0.0.1/up || echo 000)
+    maint_ok=false
+    [[ "$maint_code" == "503" ]] && maint_ok=true
+    maint_how="/up returned ${maint_code}, expected 503"
+  fi
+
+  $maint_ok || die "artisan down did not take effect — this node is STILL IN THE LOAD BALANCER.
+
+       Driver: ${maint_driver}.  ${maint_how}
 
        The next steps rewrite vendor/ and empty public/build. Running them now
        serves 404s for every hashed asset to real traffic.
@@ -743,11 +885,14 @@ if ! $DRY_RUN; then
        release's vendor/. Fix that first:
            sudo -u $APP_USER php $APP_ROOT/artisan down --render='errors::503'
        and re-run, or drain this node at the load balancer by hand."
-  ok "maintenance mode active — this node has left the load balancer"
-  printf 'bypass  : http://<this node>/?secret=%s\n' "$MAINT_SECRET"
-fi
 
-MAINT_ON=true
+  ok "maintenance mode active (driver: ${maint_driver}) — this node has left the load balancer"
+
+  # PATH form, not a query string. PreventRequestsDuringMaintenance compares
+  # $request->path() against the secret, so /?secret=... is just the home page
+  # and answers 503 like everything else.
+  printf 'bypass  : http://<this node>/%s   (sets a cookie, then redirects)\n' "$MAINT_SECRET"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 log "4/10 PHP dependencies"
@@ -760,6 +905,7 @@ if $DO_COMPOSER; then
     # now and stripped again in step 6 once the suite has passed.
     ok "installing WITH dev dependencies (test gate requested)"
     as_app_env "composer install --working-dir='$APP_ROOT' --optimize-autoloader --no-interaction --prefer-dist"
+    $DRY_RUN || DEV_DEPS_INSTALLED=true
   else
     as_app_env "composer install --working-dir='$APP_ROOT' --no-dev --optimize-autoloader --no-interaction --prefer-dist"
   fi
@@ -786,6 +932,7 @@ if $DO_BUILD; then
     as_app_env "npm --prefix '$APP_ROOT' install"
   fi
   as_app_env "npm --prefix '$APP_ROOT' run build"
+  $DRY_RUN || ASSETS_REBUILT=true
 else
   ok "skipped (--skip-build)"
 fi
