@@ -117,7 +117,7 @@ if $DO_STATUS; then
   fi
 
   log "Horizon"
-  if systemctl list-unit-files govexy-horizon.service &>/dev/null; then
+  if [[ -f "$UNIT_FILE" ]]; then
     systemctl status govexy-horizon --no-pager -n 5 || true
 
     # The specific failure worth naming: Horizon requires the three shared
@@ -142,7 +142,7 @@ if $DO_STATUS; then
       fi
     fi
 
-    if systemctl list-unit-files govexy-horizon-mountwait.timer &>/dev/null; then
+    if [[ -f "$MOUNTWAIT_TIMER" ]]; then
       systemctl is-active --quiet govexy-horizon-mountwait.timer \
         && ok "mount-wait timer active (recovers Horizon after an NFS outage)" \
         || warn "mount-wait timer is NOT active — Horizon will not self-recover"
@@ -154,7 +154,7 @@ if $DO_STATUS; then
   fi
 
   log "Bandwidth meter ingest"
-  if systemctl list-unit-files govexy-meter-ingest.timer &>/dev/null; then
+  if [[ -f "$METER_TIMER" ]]; then
     systemctl status govexy-meter-ingest.timer --no-pager -n 3 || true
     printf '    last run:\n'
     journalctl -u govexy-meter-ingest.service -n 3 --no-pager 2>/dev/null | sed 's/^/      /' || true
@@ -181,14 +181,17 @@ if $DO_REMOVE; then
   # The logrotate fragment goes with the cron entry. Left behind, logrotate
   # warns about a missing file forever.
   rm -f "$CRON_FILE" /etc/logrotate.d/govexy-scheduler && ok "cron entry removed"
-  if systemctl list-unit-files govexy-horizon.service &>/dev/null; then
+  if [[ -f "$UNIT_FILE" ]]; then
     systemctl disable --now govexy-horizon-mountwait.timer 2>/dev/null || true
     systemctl disable --now govexy-horizon 2>/dev/null || true
     rm -f "$UNIT_FILE" "$MOUNTWAIT_SERVICE" "$MOUNTWAIT_TIMER"
+    # The operator hold as well: left behind, it silently suppresses the NEXT
+    # install's recovery timer for the rest of the boot.
+    rm -f /run/govexy-horizon.hold
     systemctl daemon-reload
     ok "Horizon unit and its mount-wait timer removed"
   fi
-  if systemctl list-unit-files govexy-meter-ingest.timer &>/dev/null; then
+  if [[ -f "$METER_TIMER" ]]; then
     systemctl disable --now govexy-meter-ingest.timer 2>/dev/null || true
     rm -f "$METER_TIMER" "$METER_SERVICE" "$METER_FAILURE"
     systemctl daemon-reload
@@ -215,7 +218,11 @@ log "Pre-flight"
 # fact rather than a flag someone remembers to pass — the warning below was the
 # only thing standing between an estate and every workflow running twice.
 if $DO_SCHEDULER; then
-  NODE_ROLE_CFG="primary"
+  # Empty first, "secondary" as the fallback — the same shape as 04-deploy.sh.
+  # Initialised to "primary" this guard failed OPEN: a missing conf kept the
+  # initial value, the check passed, and any node could become a second
+  # scheduler — the exact estate-wide double-fire this file exists to prevent.
+  NODE_ROLE_CFG=""
   [[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
     NODE_ROLE_CFG=$(grep -E '^NODE_ROLE=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
                     | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}' || true)
@@ -371,10 +378,10 @@ MAILTO=""
 
 # '|| { ...; exit 1; }' rather than '&&': if APP_ROOT is unmounted or renamed
 # the cd fails, an && short-circuits, cron sees exit 0 and MAILTO="" swallows it
-# — so scheduled work stops with no trace anywhere. The echo matters as much as
-# the exit: a non-zero cron job with no output is still invisible unless someone
-# is watching /var/log/cron, and the log line says WHY.
-* * * * * ${APP_USER} cd ${APP_ROOT} || { echo "\$(date -Is) FATAL: cannot cd to ${APP_ROOT} — scheduled work is NOT running" >> ${APP_ROOT}/storage/logs/scheduler.log 2>/dev/null; exit 1; }; ${PHP_BIN} artisan schedule:run >> ${APP_ROOT}/storage/logs/scheduler.log 2>&1
+# — so scheduled work stops with no trace anywhere. The FATAL goes to the
+# JOURNAL via logger, not to scheduler.log: in the only case this branch fires,
+# APP_ROOT is gone, so a redirect into it fails along with the cd.
+* * * * * ${APP_USER} cd ${APP_ROOT} || { logger -t govexy-scheduler "FATAL: cannot cd to ${APP_ROOT} — scheduled work is NOT running"; exit 1; }; ${PHP_BIN} artisan schedule:run >> ${APP_ROOT}/storage/logs/scheduler.log 2>&1
 EOF
 
 chmod 644 "$CRON_FILE"
@@ -521,13 +528,22 @@ systemctl daemon-reload
 # stay up look healthy for the three seconds this samples, or racing the enable
 # outright. Stop it for the duration; it is re-enabled once Horizon is
 # confirmed running, which is also what makes the failure message below true.
+mountwait_was_active=false
+systemctl is-active --quiet govexy-horizon-mountwait.timer && mountwait_was_active=true
 systemctl disable --now govexy-horizon-mountwait.timer 2>/dev/null || true
 
 systemctl enable --now govexy-horizon
 sleep 3
-systemctl is-active --quiet govexy-horizon \
-  && ok "Horizon running" \
-  || die "Horizon failed to start. Inspect:  journalctl -u govexy-horizon -n 50 --no-pager
+if systemctl is-active --quiet govexy-horizon; then
+  ok "Horizon running"
+else
+  # Put back what this run temporarily disabled: dying with a previously-active
+  # recovery timer left off would remove the node's NFS-outage self-recovery as
+  # a side effect of a failed RE-RUN. A first install has nothing to restore,
+  # and a genuinely broken unit is not restarted every 60 s by this — the timer
+  # was only active if a previous run proved the unit could start.
+  $mountwait_was_active && systemctl enable --now govexy-horizon-mountwait.timer 2>/dev/null
+  die "Horizon failed to start. Inspect:  journalctl -u govexy-horizon -n 50 --no-pager
 
        If the message mentions a dependency or a mount, check the three shared
        paths are present — Horizon requires them:
@@ -535,8 +551,10 @@ systemctl is-active --quiet govexy-horizon \
            findmnt ${APP_ROOT}/storage/app/private
            findmnt ${APP_ROOT}/resources/themes
 
-       The mount-wait timer is NOT installed while Horizon cannot start, so it
-       is not masking anything here. Re-run this stage once the unit is healthy."
+       The mount-wait timer is NOT (re)installed while Horizon cannot start, so
+       it is not masking anything here. Re-run this stage once the unit is
+       healthy."
+fi
 
 systemctl enable --now govexy-horizon-mountwait.timer
 ok "mount-wait timer installed (recovers Horizon after an NFS outage at boot)"

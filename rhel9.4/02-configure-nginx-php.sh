@@ -78,6 +78,10 @@ if [[ "${1:-}" == "--set-lb" ]]; then
   exit 0
 fi
 
+# Anything else on the command line is a mistake — falling through to a full
+# reconfiguration on a typo'd flag is not what anyone asked for.
+[[ $# -eq 0 ]] || die "unknown argument: $1 (the only mode flag is --set-lb <ip> [<ip>...])"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Preflight
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,6 +149,16 @@ _post_b=$(to_bytes "$PHP_POST_MAX")
        discards the whole body and raises nothing: \$_POST and \$_FILES arrive
        empty, Laravel sees no CSRF token and returns 419 — which reads as a
        session problem, not a size one. Allow at least 8M of headroom."
+
+# Meter keys defaulted for a conf predating them — dying half-configured at
+# step 3 with "unbound variable" is worse than the documented default.
+METER_LOG="${METER_LOG:-yes}"
+METER_LOG_DIR="${METER_LOG_DIR:-/var/log/govexy-meter}"
+METER_LOG_GROUP="${METER_LOG_GROUP:-nginx}"
+if [[ "$METER_LOG" == "yes" ]]; then
+  getent group "$METER_LOG_GROUP" >/dev/null || \
+    die "METER_LOG_GROUP '${METER_LOG_GROUP}' does not exist on this node"
+fi
 
 SECURITY_HEADERS="${SECURITY_HEADERS:-yes}"
 HSTS_MAX_AGE="${HSTS_MAX_AGE:-31536000}"
@@ -306,7 +320,10 @@ install -d -o nginx -g nginx "${APP_ROOT}/public"
 semanage fcontext -a -t httpd_sys_content_t    "${APP_ROOT}(/.*)?"                 2>/dev/null || true
 semanage fcontext -a -t httpd_sys_rw_content_t "${APP_ROOT}/storage(/.*)?"         2>/dev/null || true
 semanage fcontext -a -t httpd_sys_rw_content_t "${APP_ROOT}/bootstrap/cache(/.*)?" 2>/dev/null || true
-restorecon -R "$APP_ROOT"
+# -x: never cross filesystem boundaries. On a re-run after stage 3 the three
+# NFS binds are mounted under APP_ROOT, and a bare -R walks the whole tenant
+# media export to discover it cannot label NFS anyway.
+restorecon -R -x "$APP_ROOT"
 
 # PHP must reach Redis (${REDIS_HOST}) and the remote MySQL host.
 setsebool -P httpd_can_network_connect 1
@@ -366,7 +383,10 @@ if grep -qE '^[[:space:]]*server[[:space:]]*\{' /etc/nginx/nginx.conf; then
       }
       print
     }
-  ' /etc/nginx/nginx.conf > /tmp/nginx.conf.new && mv /tmp/nginx.conf.new /etc/nginx/nginx.conf
+  ' /etc/nginx/nginx.conf > /etc/nginx/.nginx.conf.new && mv /etc/nginx/.nginx.conf.new /etc/nginx/nginx.conf
+  # mv preserves the source's SELinux label; written next to the target it is
+  # still worth re-asserting rather than leaving whatever the rename carried.
+  restorecon /etc/nginx/nginx.conf 2>/dev/null || true
   log "    commented out the stock default server block"
 fi
 
@@ -892,7 +912,8 @@ Remaining, per node:
      `chown -R nginx:nginx storage`: it descends into storage/app/public and
      storage/app/private, which are the shared media and attachment exports,
      and root_squash refuses it file by file in silence.
-  5. php artisan config:cache route:cache view:cache
+  5. php artisan config:cache && php artisan route:cache && \
+     php artisan view:cache && php artisan event:cache
      systemctl reload php-fpm
 
 Decisions this script cannot make:

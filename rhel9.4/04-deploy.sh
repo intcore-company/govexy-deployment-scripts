@@ -369,6 +369,15 @@ ASSETS_REBUILT=false
 # Set once migrations have run. Code swapped + migrated is a consistent node;
 # code swapped + not migrated is not.
 MIGRATED=false
+# Set once step 10 has lifted maintenance on a finished deploy. The final /up
+# probe exits non-zero on an unhealthy answer (to stop a for-loop over nodes),
+# and that exit re-enters cleanup() — which would otherwise diagnose a
+# COMPLETED deploy with the aborted-deploy banners and a false rollback hint.
+DEPLOY_COMPLETE=false
+# Set on a --no-pull deploy: the tree is whatever the artifact put there, which
+# is new code by definition. CODE_SWAPPED stays false (this run swapped
+# nothing), but a migrate failure must still hold the node down.
+ARTIFACT_TREE=false
 
 # EXIT, not ERR. die() calls exit, and exit does not fire an ERR trap — using
 # ERR here meant any failed pre-flight or pull left the node in maintenance mode
@@ -377,6 +386,10 @@ cleanup() {
   local status=$?
   (( status == 0 )) && return 0
   $DRY_RUN && return 0
+  # A completed deploy exiting 1 because the final /up probe was not 200: the
+  # verify section already printed what to check. Everything below diagnoses an
+  # ABORTED deploy and would hand the operator a rollback for a healthy node.
+  $DEPLOY_COMPLETE && return 0
 
   # The gap this closes: CODE_SWAPPED is set by the checkout in step 2, but
   # MAINT_ON only in step 3. Every die() in between — the ref mismatch, the
@@ -433,7 +446,7 @@ cleanup() {
   # anything out, so CODE_SWAPPED stays false, but Vite has still emptied
   # public/build and the old hashed assets are gone. Coming back up in that
   # state serves a site with no CSS.
-  if { $CODE_SWAPPED || $ASSETS_REBUILT; } && ! $MIGRATED; then
+  if { $CODE_SWAPPED || $ASSETS_REBUILT || $ARTIFACT_TREE; } && ! $MIGRATED; then
     warn ""
     warn "LEAVING THIS NODE IN MAINTENANCE MODE, deliberately."
     warn ""
@@ -444,6 +457,11 @@ cleanup() {
       warn "The working tree is now ${DEPLOY_LABEL} but its migrations"
       warn "have NOT run. Lifting maintenance would serve new code against the old"
       warn "schema. This node stays out of the load balancer until you decide."
+    elif $ARTIFACT_TREE; then
+      warn "This is a --no-pull deploy: the tree is the artifact's new release,"
+      warn "and its migrations have NOT run. Lifting maintenance would serve new"
+      warn "code against the old schema. This node stays out of the load"
+      warn "balancer until you decide."
     else
       warn "public/build has been rebuilt — Vite empties it, so the previously"
       warn "served hashed assets are gone — and migrations have NOT run. Lifting"
@@ -478,6 +496,10 @@ cleanup() {
       warn "could not strip dev dependencies — do it by hand before this node serves"
   fi
 
+  # vendor/ may have just been rewritten by the strip above, and with
+  # opcache.validate_timestamps=0 php-fpm still serves the old classmap.
+  systemctl reload php-fpm >/dev/null 2>&1 || \
+    warn "could not reload php-fpm — run: systemctl reload php-fpm"
   warn "lifting maintenance mode"
   sudo -u "$APP_USER" php "$APP_ROOT/artisan" up || \
     warn "could not lift maintenance mode; run: sudo -u $APP_USER php $APP_ROOT/artisan up"
@@ -704,7 +726,7 @@ if $DO_PULL; then
     fi
   fi
   if ! git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" rev-parse --git-dir &>/dev/null; then
-    die "git cannot read $APP_ROOT as user $APP_USER.
+    die "git (running as root) cannot read $APP_ROOT as a repository.
 
        If the message mentions 'dubious ownership', the repository is owned by a
        different user than the one running git. Check with:
@@ -715,11 +737,12 @@ if $DO_PULL; then
 
   root_git "fetch --prune --tags --force"
 
-  # BEFORE any checkout or pull, not after. Either can fail part way and leave
-  # the tree rewritten, and this flag is what tells cleanup() the node is no
-  # longer consistent. Set afterwards, exactly the failures that matter left it
-  # false and the trap said nothing.
-  $DRY_RUN || CODE_SWAPPED=true
+  # CODE_SWAPPED is set immediately BEFORE each mutating git command below —
+  # not here, and not after. fetch and the --ref validation touch nothing in
+  # the working tree, so setting it earlier made a typo'd --ref die with the
+  # tree untouched while cleanup() printed the full "this node is inconsistent"
+  # rollback banner. Setting it after a checkout meant exactly the failures
+  # that matter (a checkout dying half way) left it false.
 
   if [[ -z "$DEPLOY_REF" ]]; then
     # ── No --ref: pull the branch this node is on ──────────────────────────
@@ -727,6 +750,7 @@ if $DO_PULL; then
     # Fast-forward only. A merge here would invent a commit that exists on no
     # other node and on no build server, which is not something a deploy should
     # ever create; --ff-only turns a diverged local branch into a refusal.
+    $DRY_RUN || CODE_SWAPPED=true
     root_git "pull --ff-only"
     DEPLOY_LABEL=$(git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
                    rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
@@ -744,6 +768,9 @@ if $DO_PULL; then
        Available branches:
            git -c safe.directory=$APP_ROOT -C $APP_ROOT branch -r"
     fi
+
+    # The ref exists. Every branch below rewrites the working tree.
+    $DRY_RUN || CODE_SWAPPED=true
 
     if git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
            show-ref --verify --quiet "refs/tags/${DEPLOY_REF}"; then
@@ -785,6 +812,14 @@ else
   # whatever the artifact put there. Say that rather than naming a branch this
   # run never touched.
   DEPLOY_LABEL="the existing tree (--no-pull)"
+  $DRY_RUN || ARTIFACT_TREE=true
+  # If the artifact is a git checkout, record its commit so the cross-node
+  # check below still runs. A bare export has nothing to record — and then the
+  # check is off, in both directions.
+  if ! $DRY_RUN && artifact_sha=$(git -c safe.directory="$APP_ROOT" -C "$APP_ROOT" \
+                                    rev-parse HEAD 2>/dev/null); then
+    DEPLOYED_SHA="$artifact_sha"
+  fi
   ok "skipped (--no-pull)"
 fi
 
@@ -800,8 +835,12 @@ fi
 # lets --ref be optional without giving up the guarantee.
 if ! $DRY_RUN && [[ -n "${DEPLOYED_SHA:-}" ]]; then
   if $PRIMARY; then
-    write_shared_marker "$DEPLOYED_REF_FILE" \
-      "${DEPLOYED_SHA} ${DEPLOY_LABEL:-HEAD}" "deployed commit"
+    # Recorded in step 7, AFTER migrations succeed — not here. Written this
+    # early it asserted a commit whose migrations might never run: a primary
+    # dying at the test gate left a marker the secondaries' sha compare
+    # accepted, and the pending-migrations guard is silent for a release with
+    # no migrations.
+    :
   elif primary_line=$(sudo -u "$APP_USER" head -1 "$DEPLOYED_REF_FILE" 2>/dev/null) \
        && [[ -n "$primary_line" ]]; then
     # As the app user, for the same reason as the fingerprint above: root is
@@ -817,8 +856,9 @@ if ! $DRY_RUN && [[ -n "${DEPLOYED_SHA:-}" ]]; then
 
        The two would run different code against one database — usually a push
        that landed between the two deploys. Pin this node to what the primary
-       actually deployed:
-           bash 04-deploy.sh --ref ${primary_label:-$primary_sha}
+       actually deployed — the SHA, because a branch name may have moved again
+       since the primary pulled it:
+           bash 04-deploy.sh --ref ${primary_sha}
        or re-deploy the primary onto what you intended first."
   else
     warn "no commit recorded by a primary node yet (${DEPLOYED_REF_FILE} absent)."
@@ -850,8 +890,12 @@ if ! $PRIMARY && ! $DRY_RUN; then
 
 $(printf '%s\n' "$migrate_status" | sed 's/^/       /')
 
-       Cannot tell whether the primary has deployed this release. Fix the
-       database connection or the boot failure above before deploying."
+       Cannot tell whether the primary has deployed this release. NOTE: this
+       check boots the NEW checkout against the PREVIOUS release's vendor/
+       (composer runs in step 4), so a release that adds a dependency fatals
+       here — that is vendor skew, not a database problem; the exception above
+       names the missing class. Otherwise fix the database connection or the
+       boot failure above before deploying."
 
   # Anchored on the leader dots that only a real status table has, with the
   # alternation PARENTHESISED. Bare '\[[0-9]+\] Ran|Pending' binds as
@@ -918,6 +962,50 @@ if $DO_TESTS && ! $DRY_RUN; then
        outside the maintenance window to work around this: that puts a node
        with a half-swapped vendor/ and public/build back into the load
        balancer, which is the more expensive of the two failures."
+
+  # The rest of the gate's preconditions, asserted HERE — before maintenance,
+  # composer and the Vite build. Each is knowable now; asserting them in step 6
+  # meant dying inside the window, with dev dependencies installed and
+  # public/build emptied, over a condition that was true before the deploy
+  # started.
+  [[ -d "$APP_ROOT/tests" && -f "$APP_ROOT/phpunit.xml" ]] || \
+    die "no test suite in this checkout (tests/ or phpunit.xml missing).
+       Deploy with --skip-tests."
+
+  grep -q 'name="DB_CONNECTION" value="sqlite"'   "$APP_ROOT/phpunit.xml" && \
+  grep -q 'name="DB_DATABASE" value=":memory:"'   "$APP_ROOT/phpunit.xml" || \
+    die "phpunit.xml does not pin the suite to sqlite/:memory:.
+
+       Refusing to run tests: the suite uses RefreshDatabase, and without that
+       pin it would migrate:fresh the production database named in .env."
+
+  php -m | grep -qix pdo_sqlite || \
+    die "pdo_sqlite extension is missing — the suite cannot run.
+       Install it:  dnf -y install php-pdo   (it carries pdo_sqlite.so)
+       (01-install-dependencies.sh installs and verifies both.)"
+
+  # PHPUnit's <env> elements do NOT overwrite a variable that already exists in
+  # the process environment unless force="true", and none of the entries in
+  # phpunit.xml set it. The gate is safe only because the run in step 6 starts
+  # from an empty environment. Assert that nothing was exported into this
+  # deploy that would beat the sqlite pin — a single `Defaults env_keep +=
+  # "DB_*"` in /etc/sudoers, or an operator who exported DB_CONNECTION while
+  # debugging, is enough.
+  for v in DB_CONNECTION DB_DATABASE DB_HOST DB_USERNAME DB_PASSWORD APP_ENV \
+           FILESYSTEM_DISK CACHE_STORE SESSION_DRIVER QUEUE_CONNECTION; do
+    # The value is shown for everything except the password, which would end
+    # up in the operator's scrollback and in any log they paste into a ticket.
+    if [[ -n "${!v:-}" ]]; then
+      case "$v" in
+        *PASSWORD*|*SECRET*|*KEY*) shown="(value not shown)" ;;
+        *)                         shown="'${!v}'" ;;
+      esac
+      die "$v is set in the deploy environment ${shown}.
+
+       PHPUnit's <env> does not override an inherited variable, so this would
+       beat the pins in phpunit.xml. Unset it and re-run."
+    fi
+  done
 fi
 
 # A bypass secret, so the node can be smoke-tested through the load balancer
@@ -1048,50 +1136,10 @@ if $DO_TESTS; then
   # Safety gate. phpunit.xml pins the suite to sqlite/:memory:, array cache and
   # session, and a sync queue, so it cannot reach the production MySQL or Redis.
   # That isolation is the ONLY reason running the suite on a live node is
-  # acceptable — verify it rather than trusting it, because a phpunit.xml that
-  # ever lost those lines would run RefreshDatabase against the real database
-  # and drop every table in it.
+  # acceptable. It is verified — not trusted — in step 3, BEFORE the
+  # maintenance window: the sqlite pin, pdo_sqlite, a clean environment and the
+  # presence of tests/ were all asserted there.
   if ! $DRY_RUN; then
-    grep -q 'name="DB_CONNECTION" value="sqlite"'   "$APP_ROOT/phpunit.xml" && \
-    grep -q 'name="DB_DATABASE" value=":memory:"'   "$APP_ROOT/phpunit.xml" || \
-      die "phpunit.xml does not pin the suite to sqlite/:memory:.
-
-       Refusing to run tests: the suite uses RefreshDatabase, and without that
-       pin it would migrate:fresh the production database named in .env."
-
-    php -m | grep -qix pdo_sqlite || \
-      die "pdo_sqlite extension is missing — the suite cannot run.
-       Install it:  dnf -y install php-pdo   (it carries pdo_sqlite.so)
-       (01-install-dependencies.sh installs and verifies both.)"
-
-    # PHPUnit's <env> elements do NOT overwrite a variable that already exists
-    # in the process environment unless force="true", and none of the entries in
-    # phpunit.xml set it. The gate is therefore safe only because the run below
-    # starts from an empty environment. Assert that nothing was exported into
-    # this deploy that would beat the sqlite pin and let RefreshDatabase loose on
-    # the production database — a single `Defaults env_keep += "DB_*"` in
-    # /etc/sudoers, or an operator who exported DB_CONNECTION while debugging,
-    # is enough.
-    for v in DB_CONNECTION DB_DATABASE DB_HOST DB_USERNAME DB_PASSWORD APP_ENV \
-             FILESYSTEM_DISK CACHE_STORE SESSION_DRIVER QUEUE_CONNECTION; do
-      # The value is shown for everything except the password, which would end
-      # up in the operator's scrollback and in any log they paste into a ticket.
-      if [[ -n "${!v:-}" ]]; then
-        case "$v" in
-          *PASSWORD*|*SECRET*|*KEY*) shown="(value not shown)" ;;
-          *)                         shown="'${!v}'" ;;
-        esac
-        die "$v is set in the deploy environment ${shown}.
-
-       PHPUnit's <env> does not override an inherited variable, so this would
-       beat the pins in phpunit.xml. Unset it and re-run."
-      fi
-    done
-
-    [[ -d "$APP_ROOT/tests" && -f "$APP_ROOT/phpunit.xml" ]] || \
-      die "no test suite in this checkout (tests/ or phpunit.xml missing).
-       Deploy with --skip-tests."
-
     # Pest lives in require-dev, so a vendor/ built with --no-dev — by an earlier
     # deploy, or shipped that way inside the artifact — has no test runner. The
     # composer step above installs dev dependencies when tests are requested, but
@@ -1105,6 +1153,7 @@ if $DO_TESTS; then
       fi
       log "    installing dev dependencies so the suite can run"
       as_app_env "composer install --working-dir='$APP_ROOT' --optimize-autoloader --no-interaction --prefer-dist"
+      $DRY_RUN || DEV_DEPS_INSTALLED=true
       reown
       [[ -x "$APP_ROOT/vendor/bin/pest" ]] || \
         die "pest is still missing after installing dev dependencies.
@@ -1139,19 +1188,6 @@ if $DO_TESTS; then
     THEME_SHARE_BEFORE=$(find "$APP_ROOT/resources/themes" -maxdepth 1 -mindepth 1 2>/dev/null | sort)
   fi
 
-  # Prove config caching works, then get out of its way.
-  #
-  # config:cache fails loudly on a config file that throws or contains a closure,
-  # so building it here catches that class of breakage BEFORE migrations run
-  # rather than in step 8 afterwards.
-  #
-  # It is then cleared, because Laravel reads bootstrap/cache/config.php when it
-  # exists and never calls env() again — a cached config silently overrides every
-  # <env> in phpunit.xml, LICENSE_MODE=saas included. Left in place, the suite
-  # runs against this installation's onprem settings and the entire billing suite
-  # fails for a reason that has nothing to do with the code being deployed.
-  #
-  # Step 8 rebuilds the cache for real once the suite has passed.
   # No cached config while the suite runs. Laravel reads bootstrap/cache/config.php
   # when it exists and never calls env() again, so a cached config overrides every
   # <env> in phpunit.xml — LICENSE_MODE=saas included — and the suite silently runs
@@ -1256,10 +1292,9 @@ if $DO_TESTS; then
 
   FAILED_LINES=$(grep -E '(⨯|✕|FAIL(ED)?\s)' "$TEST_LOG" 2>/dev/null || true)
   if [[ -n "$FAILED_LINES" ]]; then
-    FAILED_COUNT=$(printf '%s\n' "$FAILED_LINES" | grep -cE '⨯|✕' || true)
-    printf '\n\033[1;31mFailures (%s):\033[0m\n' "${FAILED_COUNT:-?}"
-    printf '%s\n' "$FAILED_LINES" | head -40 | sed 's/^/  /'
     total_failed=$(printf '%s\n' "$FAILED_LINES" | wc -l | tr -d ' ')
+    printf '\n\033[1;31mFailure lines (%s):\033[0m\n' "$total_failed"
+    printf '%s\n' "$FAILED_LINES" | head -40 | sed 's/^/  /'
     (( total_failed > 40 )) && printf '  ... %d more, see %s\n' "$(( total_failed - 40 ))" "$TEST_LOG"
   fi
   printf '\033[1m──────────────────────────────────────────────\033[0m\n\n'
@@ -1327,16 +1362,20 @@ if $DO_TESTS; then
     fi
   fi
 
-  # Strip dev dependencies again so they never reach a serving node.
-  if $DO_COMPOSER; then
+  # Strip dev dependencies again so they never reach a serving node. Gated on
+  # DEV_DEPS_INSTALLED, not DO_COMPOSER: the repair path above installs them
+  # even under --skip-composer, and they must be stripped all the same.
+  if $DEV_DEPS_INSTALLED; then
     log "    removing dev dependencies"
     as_app_env "composer install --working-dir='$APP_ROOT' --no-dev --optimize-autoloader --no-interaction --prefer-dist"
     # They are gone, so cleanup() must not run the strip a second time on a
     # later failure — that is a full dependency resolve inside the window for
     # nothing.
     $DRY_RUN || DEV_DEPS_INSTALLED=false
-  else
-    warn "dev dependencies remain installed (--skip-composer given with --with-tests)"
+  elif [[ -x "$APP_ROOT/vendor/bin/pest" ]]; then
+    warn "dev dependencies were already present before this deploy — not stripping"
+    warn "what this run did not install. Remove them by hand:"
+    warn "    sudo -u $APP_USER composer install --working-dir=$APP_ROOT --no-dev"
   fi
 
   # `artisan test` clears the config cache; step 8 rebuilds it.
@@ -1352,7 +1391,10 @@ log "7/10 Database"
 if $PRIMARY; then
   # --isolated takes a lock in the cache store (Redis, shared by every node)
   # for the duration. If a second node is given --primary at the same moment it
-  # exits without migrating rather than racing.
+  # refuses rather than racing — with exit 13, because the DEFAULT isolated
+  # exit code is 0 (success), which made that refusal indistinguishable from a
+  # completed migrate: the node then cached and lifted maintenance on a schema
+  # someone else was still writing.
   #
   # This matters because MySQL DDL is not transactional: two concurrent migrate
   # runs can both read the same pending list, both apply a migration, and leave
@@ -1360,8 +1402,27 @@ if $PRIMARY; then
   #
   # Run sequentially it is a no-op anyway — the second run finds every migration
   # already recorded. The lock only guards the simultaneous case.
-  as_app "php '$APP_ROOT/artisan' migrate --force --isolated"
+  set +e
+  as_app "php '$APP_ROOT/artisan' migrate --force --isolated=13"
+  migrate_rc=$?
+  set -e
+  if (( migrate_rc == 13 )); then
+    die "another migrate holds the isolation lock — a second --primary deploy
+       is running against this database right now. Wait for it to finish, then
+       re-run this one."
+  elif (( migrate_rc != 0 )); then
+    die "migrate failed (exit ${migrate_rc}) — see the output above. This node
+       stays in maintenance mode."
+  fi
   $DRY_RUN || MIGRATED=true
+
+  # Only now is the deployed-commit marker written: the commit it names has its
+  # schema in place. Secondaries compare against it in step 2, and their
+  # pending-migrations guard covers the window before a primary gets here.
+  if ! $DRY_RUN && [[ -n "${DEPLOYED_SHA:-}" ]]; then
+    write_shared_marker "$DEPLOYED_REF_FILE" \
+      "${DEPLOYED_SHA} ${DEPLOY_LABEL:-HEAD}" "deployed commit"
+  fi
 
   # Theme assets, primary only, right after migrations.
   #
@@ -1517,9 +1578,7 @@ fi
 
 as_app "php '$APP_ROOT/artisan' up"
 MAINT_ON=false
-# No `trap - ERR` here: the trap installed above is on EXIT, deliberately (see
-# the comment beside cleanup()), and removing a trap that was never installed
-# only reads as if one had been.
+DEPLOY_COMPLETE=true
 
 # ─────────────────────────────────────────────────────────────────────────────
 log "Verify"
@@ -1536,8 +1595,16 @@ FINAL_RC=0
 # Localhost with the node's own hostname as the Host header: the vhost is a
 # catch-all, but the application resolves the tenant from the host, so a bare IP
 # is not what a real request looks like.
-UP_CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 20 \
-  -H "Host: $(hostname -f 2>/dev/null || hostname)" http://127.0.0.1/up || true)
+# Retried: a graceful php-fpm reload (step 10) can answer 502 for the first
+# requests while workers respawn, and a single transient non-200 here both
+# blocks the next node and reads as an unhealthy deploy.
+UP_CODE=000
+for up_attempt in 1 2 3 4 5; do
+  UP_CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 20 \
+    -H "Host: $(hostname -f 2>/dev/null || hostname)" http://127.0.0.1/up || true)
+  [[ "$UP_CODE" == "200" ]] && break
+  (( up_attempt < 5 )) && sleep 2
+done
 printf 'up      : %s\n' "$UP_CODE"
 if [[ "$UP_CODE" != "200" ]]; then
   warn "/up returned ${UP_CODE} — this node is NOT healthy. Do not deploy the next node."
@@ -1570,7 +1637,8 @@ should check — an nginx-only check answers 200 on a node whose PHP is dead.
 
 Repeat on every other node WITHOUT --primary. Take them one at a time so the
 load balancer always has a healthy member. Each one is checked against the
-commit this node just recorded, so they cannot drift apart.
+commit this node recorded (whenever the tree is a git checkout — a bare
+--no-pull artifact records nothing), so they cannot drift apart.
 
     bash 04-deploy.sh${DEPLOY_REF:+ --ref }${DEPLOY_REF}
 

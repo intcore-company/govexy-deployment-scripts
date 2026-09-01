@@ -137,6 +137,9 @@ PHP_PKGS=(
   php-bcmath php-opcache php-mysqlnd php-pdo php-sodium php-process
   php-pecl-zip php-pecl-redis6
 )
+# Defaulted like INSTALL_NODE below: a conf predating this key would otherwise
+# abort the stage under set -u, half way through, over an optional extension.
+INSTALL_IMAGICK="${INSTALL_IMAGICK:-yes}"
 [[ "$INSTALL_IMAGICK" == "yes" ]] && PHP_PKGS+=(php-pecl-imagick ImageMagick)
 
 # One transaction. Each extra dnf install costs another RHSM uploader wait.

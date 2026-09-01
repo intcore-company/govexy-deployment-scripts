@@ -607,7 +607,10 @@ systemctl reload php-fpm
 The full tail of a deploy, per node:
 
 ```bash
-php artisan config:cache route:cache view:cache
+php artisan config:cache
+php artisan route:cache
+php artisan view:cache
+php artisan event:cache
 systemctl reload php-fpm
 ```
 
@@ -758,10 +761,14 @@ mount -a
 systemctl start govexy-horizon
 ```
 
-`reset-failed` is only needed if the unit is genuinely in the `failed` state —
-which here means it hit the start rate limit, not that a dependency was missing.
-An unsatisfied `RequiresMountsFor=` leaves the unit **inactive**, and `start`
-works on it directly once the mounts are there. Check before reaching for it:
+`reset-failed` is only needed if the unit is genuinely in the `failed` state.
+The unit disables the start rate limit (`StartLimitIntervalSec=0`), so `failed`
+here means the start job itself failed — typically the node booted while NFS
+was down and the mounts were absent. An unsatisfied `RequiresMountsFor=` on a
+later start attempt leaves the unit **inactive**, and `start` works on it
+directly once the mounts are there. The mount-wait timer already runs
+`reset-failed` before each recovery attempt, so this usually resolves itself;
+by hand, check first:
 
 ```bash
 systemctl is-failed govexy-horizon     # "failed" -> reset-failed first
