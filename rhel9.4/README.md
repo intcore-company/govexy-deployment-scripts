@@ -140,6 +140,8 @@ every entry as IPv4 and dies on a malformed one.
 | Variable | Required | Default | Effect |
 |---|---|---|---|
 | `INSTALL_IMAGICK` | no | `yes` | `yes` adds `php-pecl-imagick` and `ImageMagick` to the stage 1 package set — PDF thumbnails and better image conversions. Any other value omits them. |
+| `INSTALL_NODE` | no | `yes` | `yes` installs Node.js from AppStream in stage 1 — needed only when front-end assets are built ON the node. `no` = build on a CI/build host, ship `public/build` in the artifact, deploy with `--skip-build`. |
+| `NODE_STREAM` | no | `22` | AppStream module stream: 18, 20 or 22. Vite 7 requires Node `^20.19 \|\| >=22.12`, so 22 is the safe choice; 18/20 only warn. |
 
 ### Runtime tuning
 
@@ -156,6 +158,26 @@ every entry as IPv4 and dies on a malformed one.
 | Variable | Required | Default | Effect |
 |---|---|---|---|
 | `RESTRICT_HTTP_TO_LB` | yes | `no` | `no` opens the `http` and `https` firewalld services to everyone. `yes` removes both and instead adds a rich rule accepting `http` only from each `LB_IPS/32`. Stage 2 **dies** if this is `yes` while `LB_IPS` is empty — that combination would firewall the node off from everything. |
+
+### Bandwidth meter log
+
+| Variable | Required | Default | Effect |
+|---|---|---|---|
+| `METER_LOG` | no | `yes` | `yes`: stage 2 creates the dedicated nginx access log (one line per request, the `govexy_meter` format) and its logrotate fragment; stage 5 installs the ingest timer that drains it into the database. This **is** the per-tenant bandwidth meter — nothing in the PHP request path counts bytes. `no` means tenant bandwidth is not billed from this node. |
+| `METER_LOG_DIR` | no | `/var/log/govexy-meter` | Where nginx writes it (`0750 nginx:$METER_LOG_GROUP`, files `0640`, SELinux `httpd_log_t`). Deliberately **not** `/var/log/nginx`, which is root-owned `0700` — the application user could never read it and the meter would read zero, silently. |
+| `METER_LOG_GROUP` | no | `nginx` | The group allowed to READ the log. Must contain the application user, or the ingest silently reads nothing. Stage 2 dies if the group does not exist. |
+
+### Security headers
+
+| Variable | Required | Default | Effect |
+|---|---|---|---|
+| `SECURITY_HEADERS` | no | `yes` | `no` only when an upstream tier (the gov proxy) already sets them — double headers are worse than one set. |
+| `HSTS_MAX_AGE` | no | `31536000` | One year. Emitted only when the request arrived over HTTPS (`X-Forwarded-Proto: https`); browsers ignore HSTS on plaintext responses. |
+| `HSTS_INCLUDE_SUBDOMAINS` | no | `yes` | Standard hardening alongside `HSTS_MAX_AGE`. |
+| `HSTS_PRELOAD` | no | `no` | A one-way door: every current and future subdomain must serve valid HTTPS and delisting takes months. Needs sign-off, not a config flip. |
+| `FRAME_OPTIONS` | no | `SAMEORIGIN` | **Must stay `SAMEORIGIN`** — the visual page builder renders its preview in an iframe and drives it over postMessage; `DENY` breaks page editing. |
+| `CSP_MODE` | no | `no` | `no` \| `report-only` \| `enforce`. Default deliberately off: tenants enable GA/GTM/Pixel/reCAPTCHA from the dashboard and themes load their own assets, so an unenumerated CSP silently breaks tenant sites weeks later. Roll out `report-only` first. |
+| `CSP_REPORT_URI` | no | `""` | Optional violation endpoint for `report-only`. |
 
 ### Deploy
 
@@ -387,13 +409,14 @@ rolled back too.
 
 | Step | Actions |
 |---|---|
-| 1/7 Base system | `hostnamectl set-hostname` if `NODE_HOSTNAME` set; `timedatectl set-timezone`; enable CodeReady Builder (warn on failure); install `epel-release` from `dl.fedoraproject.org` if absent; install `dnf-plugins-core policycoreutils-python-utils firewalld chrony vim unzip tar git curl`; `systemctl enable --now chronyd firewalld`. |
-| 2/7 dnf tolerance | Sets `timeout=300`, `minrate=100`, `retries=10` in `/etc/dnf/dnf.conf`. The stock `minrate=1000` B/s is what produced `Curl error (28): Operation too slow` on Remi metadata through this proxy. |
-| 3/7 nginx | `dnf -y install nginx` from AppStream. Warns if the binary lacks `http_realip_module` (which would make LB real-IP impossible). **Does not start it** — stage 2 writes the vhost first. |
-| 4/7 Remi | Installs `remi-release-9.rpm` from `rpms.remirepo.net`. Backs up each `/etc/yum.repos.d/remi*.repo` to `.bak`, then comments out `mirrorlist=`/`metalink=`, uncomments `baseurl=`, and forces the baseurl to `https://rpms.remirepo.net/`. Enables `remi-safe` and `remi-modular`. `dnf clean all && dnf makecache`. |
-| 5/7 PHP 8.4 | `dnf module reset php`, `dnf module enable php:remi-8.4`, and **dies** if that stream is not then marked enabled. Installs, in one transaction: `php-cli php-fpm php-common php-mbstring php-xml php-gd php-intl php-bcmath php-opcache php-mysqlnd php-pdo php-sodium php-process php-pecl-zip php-pecl-redis6`, plus `php-pecl-imagick ImageMagick` when `INSTALL_IMAGICK=yes`. One transaction on purpose — each extra `dnf install` costs another RHSM uploader wait. |
-| 6/7 Composer | `dnf -y install composer` if not already on `PATH`. Distro package, not `getcomposer.org` — see [prerequisites](#network-egress). |
-| 7/7 Verification | **Dies** unless `php -v` reports 8.4. Warns (does not fail) on any missing extension from: `curl fileinfo intl mbstring redis sodium zip pcntl posix pdo_mysql gd bcmath openssl tokenizer dom xmlwriter exif`. Prints `php -v`, `composer --version`, `nginx -v`. |
+| 1/8 Base system | `hostnamectl set-hostname` if `NODE_HOSTNAME` set; `timedatectl set-timezone`; enable CodeReady Builder (warn on failure); install `epel-release` from `dl.fedoraproject.org` if absent; install `dnf-plugins-core policycoreutils-python-utils firewalld chrony vim unzip tar git curl cronie logrotate nfs-utils` (cronie: stage 5 restarts `crond`; logrotate: stages 2 and 5 install fragments; nfs-utils: the stage 3 mounts and `nfsstat`); `systemctl enable --now chronyd firewalld`. |
+| 2/8 dnf tolerance | Sets `timeout=300`, `minrate=100`, `retries=10` in `/etc/dnf/dnf.conf`. The stock `minrate=1000` B/s is what produced `Curl error (28): Operation too slow` on Remi metadata through this proxy. |
+| 3/8 nginx | `dnf -y install nginx` from AppStream. Warns if the binary lacks `http_realip_module` (which would make LB real-IP impossible). **Does not start it** — stage 2 writes the vhost first. |
+| 4/8 Remi | Installs `remi-release-9.rpm` from `rpms.remirepo.net`. Backs up each `/etc/yum.repos.d/remi*.repo` to `.bak`, then comments out `mirrorlist=`/`metalink=`, uncomments `baseurl=`, and forces the baseurl to `https://rpms.remirepo.net/`. Enables `remi-safe` and `remi-modular`. `dnf clean all && dnf makecache`. |
+| 5/8 PHP 8.4 | `dnf module reset php`, `dnf module enable php:remi-8.4`, and **dies** if that stream is not then marked enabled. Installs, in one transaction: `php-cli php-fpm php-common php-mbstring php-xml php-gd php-intl php-bcmath php-opcache php-mysqlnd php-pdo php-sodium php-process php-pecl-zip php-pecl-redis6`, plus `php-pecl-imagick ImageMagick` when `INSTALL_IMAGICK=yes`. One transaction on purpose — each extra `dnf install` costs another RHSM uploader wait. |
+| 6/8 Composer | `dnf -y install composer` if not already on `PATH`. Distro package, not `getcomposer.org` — see [prerequisites](#network-egress). |
+| 7/8 Node.js | Only when `INSTALL_NODE=yes`: enables the AppStream module `nodejs:${NODE_STREAM}` and installs `nodejs npm`. **Dies** on a stream other than 18/20/22, warns on 18/20 (Vite 7 requires Node `^20.19 \|\| >=22.12`). `INSTALL_NODE=no` skips it — assets are then built off-server and deployed with `--skip-build`. |
+| 8/8 Verification | **Dies** unless `php -v` reports 8.4, and **dies** on any missing required extension: `curl fileinfo intl mbstring redis sodium zip pcntl posix pdo_mysql pdo_sqlite sqlite3 gd bcmath openssl tokenizer dom xmlwriter` (`pdo_sqlite`/`sqlite3` because the deploy test gate runs Pest against sqlite/:memory: and `04-deploy.sh` refuses without them). Warns only on the optional `exif`/`imagick`. Prints `php -v`, `composer --version`, `nginx -v` (and node/npm when installed). |
 
 ### `02-configure-nginx-php.sh` — configuration, starts services
 
@@ -549,9 +572,18 @@ Remaining work, per node unless stated:
 
 5. **Ownership and SELinux relabel after deploying code:**
 
+   Never `chown -R` across `storage/` — it descends into `storage/app/public`
+   and `storage/app/private`, the shared NFS exports, where `root_squash`
+   refuses it file by file in silence (see stage 2's closing notes). Prune the
+   binds, exactly as `04-deploy.sh` does:
+
    ```bash
-   chown -R nginx:nginx /var/www/govexy/storage /var/www/govexy/bootstrap/cache
-   restorecon -R /var/www/govexy
+   find /var/www/govexy -xdev \
+     -path /var/www/govexy/storage/app/public -prune -o \
+     -path /var/www/govexy/storage/app/private -prune -o \
+     -path /var/www/govexy/resources/themes -prune -o \
+     \( ! -user nginx -o ! -group nginx \) -exec chown nginx:nginx {} +
+   restorecon -R -x /var/www/govexy
    ```
 
 6. **`storage:link`** — on **every** node. The symlink is node-local: it lives in

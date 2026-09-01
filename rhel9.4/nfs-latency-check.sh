@@ -26,7 +26,12 @@ warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
 
 [[ -d "$APP_ROOT" ]] || { echo "no such directory: $APP_ROOT" >&2; exit 1; }
+# The write probes run as the application user: the export is root_squash
+# (recommended), so root's writes map to nobody and either fail or skip the
+# very NFS row this script exists to measure.
+APP_USER=$(stat -c '%U' "$APP_ROOT")
 mkdir -p "$LOCAL_DIR"
+chown "$APP_USER" "$LOCAL_DIR" 2>/dev/null || true
 
 THEMES="$APP_ROOT/resources/themes"
 MEDIA="$APP_ROOT/storage/app/public"
@@ -34,7 +39,7 @@ MEDIA="$APP_ROOT/storage/app/public"
 # The media probe is 64 MB and lives on the PRODUCTION media export. An
 # interrupted run between dd and rm would leave it there permanently, served
 # over HTTP at /storage/.nfsbench.<pid>.
-trap 'rm -rf "$LOCAL_DIR"; rm -f "$MEDIA/.nfsbench.$$" 2>/dev/null' EXIT
+trap 'rm -rf "$LOCAL_DIR"; sudo -u "$APP_USER" rm -f "$MEDIA/.nfsbench.$$" 2>/dev/null' EXIT
 
 # ─────────────────────────────────────────────────────────────────────────────
 log "1. Mount configuration"
@@ -149,13 +154,16 @@ log "4. Read throughput"
 
 bench_read() {
   local dir="$1" label="$2"
-  [[ -d "$dir" && -w "$dir" ]] || { warn "not writable, skipping: $label"; return; }
+  # Writability tested AS THE APP USER: root's answer is wrong in both
+  # directions on a root_squash export.
+  sudo -u "$APP_USER" test -d "$dir" && sudo -u "$APP_USER" test -w "$dir" \
+    || { warn "not writable by ${APP_USER}, skipping: $label"; return; }
   local f="$dir/.nfsbench.$$"
   local w r
-  w=$( { time -p dd if=/dev/zero of="$f" bs=1M count=64 conv=fsync 2>/dev/null; } 2>&1 | awk '/real/{print $2}')
+  w=$( { time -p sudo -u "$APP_USER" dd if=/dev/zero of="$f" bs=1M count=64 conv=fsync 2>/dev/null; } 2>&1 | awk '/real/{print $2}')
   sync
-  r=$( { time -p dd if="$f" of=/dev/null bs=1M 2>/dev/null; } 2>&1 | awk '/real/{print $2}')
-  rm -f "$f"
+  r=$( { time -p sudo -u "$APP_USER" dd if="$f" of=/dev/null bs=1M 2>/dev/null; } 2>&1 | awk '/real/{print $2}')
+  sudo -u "$APP_USER" rm -f "$f"
   printf '  %-28s write %ss  read %ss  (64 MB)\n' "$label" "$w" "$r"
 }
 

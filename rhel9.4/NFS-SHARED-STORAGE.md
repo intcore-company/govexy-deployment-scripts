@@ -99,9 +99,9 @@ application paths:
 
 ```fstab
 nfs-server:/govexy       /srv/govexy-share                    nfs4  _netdev,hard,timeo=600,retrans=2,noatime,nodiratime  0 0
-/srv/govexy-share/media    /var/www/govexy/storage/app/public   none  bind,nofail,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
-/srv/govexy-share/private  /var/www/govexy/storage/app/private  none  bind,nofail,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
-/srv/govexy-share/themes   /var/www/govexy/resources/themes     none  bind,nofail,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
+/srv/govexy-share/media    /var/www/govexy/storage/app/public   none  bind,nofail,_netdev,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
+/srv/govexy-share/private  /var/www/govexy/storage/app/private  none  bind,nofail,_netdev,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
+/srv/govexy-share/themes   /var/www/govexy/resources/themes     none  bind,nofail,_netdev,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
 ```
 
 - **`x-systemd.requires-mounts-for`** is what stops a bind firing before the NFS export is
@@ -198,8 +198,9 @@ sudo -u nginx sh -c 'echo probe > /var/www/govexy/storage/app/public/.nfs-probe'
 cat /var/www/govexy/storage/app/public/.nfs-probe      # expect: probe
 sudo -u nginx test -w /var/www/govexy/storage/app/public && echo writable
 
-# cleanup
-rm -f /var/www/govexy/storage/app/public/.nfs-probe
+# cleanup — as the app user: root is squashed on the export, and `rm -f`
+# swallows the refusal, leaving the probe file behind
+sudo -u nginx rm -f /var/www/govexy/storage/app/public/.nfs-probe
 ```
 
 Repeat for `storage/app/private` and `resources/themes`.

@@ -133,8 +133,12 @@ log "2/7  Application root"
 # ═════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_APP_ROOT="/var/www/govexy"
-[[ -f "${BASH_SOURCE%/*}/govexy-node.conf" ]] && \
-  DEFAULT_APP_ROOT=$(grep -E '^APP_ROOT=' "${BASH_SOURCE%/*}/govexy-node.conf" 2>/dev/null \
+# dirname, not ${BASH_SOURCE%/*}: invoked as `bash 03-mount-shared-storage.sh`
+# BASH_SOURCE has no slash, the %/* expansion is a no-op, and the probe path
+# became "03-mount-shared-storage.sh/govexy-node.conf" — the conf was never read.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
+  DEFAULT_APP_ROOT=$(grep -E '^APP_ROOT=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
     | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}') || true
 DEFAULT_APP_ROOT="${DEFAULT_APP_ROOT:-/var/www/govexy}"
 
@@ -247,7 +251,10 @@ for m in "${MAPPINGS[@]}"; do
       #
       # Reported rather than fatal, for the same reason: a partial seed is a
       # state the operator must see in full, not one to die in the middle of.
-      if run "sudo -u '$APP_USER' cp -a --no-preserve=ownership '${tgt}/.' '${src}/'"; then
+      if $DRY_RUN; then
+        run "sudo -u '$APP_USER' cp -a --no-preserve=ownership '${tgt}/.' '${src}/'"
+        ok "would seed $src"
+      elif run "sudo -u '$APP_USER' cp -a --no-preserve=ownership '${tgt}/.' '${src}/'"; then
         ok "seeded $src"
       else
         warn "seeding $src did not complete — some entries were not copied."
@@ -304,20 +311,26 @@ trap 'rm -f "$FSTAB_NEW"' EXIT
 for m in "${MAPPINGS[@]}"; do
   IFS='|' read -r src tgt label <<< "$m"
 
-  # -F, on the target surrounded by spaces. The previous ERE escaped every '/',
-  # which is unnecessary in an ERE and strictly an undefined escape.
-  if grep -q -F " ${tgt} " /etc/fstab || grep -q -F "	${tgt}	" /etc/fstab; then
+  # By field, not by delimiter: a hand-written line mixing tabs and spaces
+  # around the target defeated both fixed-string greps, and the duplicate bind
+  # was appended — mount -a then stacks it.
+  if awk -v t="$tgt" '!/^[[:space:]]*#/ && $2 == t { found=1 } END { exit !found }' /etc/fstab; then
     ok "fstab entry already present: $tgt"
     continue
   fi
 
-  printf '%s  %s  none  bind,nofail,x-systemd.requires-mounts-for=%s  0 0\n' \
+  printf '%s  %s  none  bind,nofail,_netdev,x-systemd.requires-mounts-for=%s  0 0\n' \
     "$src" "$tgt" "$EXPORT_ROOT" >> "$FSTAB_NEW"
   FSTAB_ADDED=$((FSTAB_ADDED + 1))
 done
 
 if (( FSTAB_ADDED > 0 )); then
-  run "cp -a /etc/fstab '/etc/fstab.bak.\$(date +%s)'"
+  # Computed BEFORE run(): inside run's eval the substitution sat in single
+  # quotes, so the backup was one literal file named '/etc/fstab.bak.$(date +%s)'
+  # — and a second run overwrote the only copy of the original with the already-
+  # modified fstab.
+  fstab_bak="/etc/fstab.bak.$(date +%s)"
+  run "cp -a /etc/fstab '$fstab_bak'"
   run "cat '$FSTAB_NEW' >> /etc/fstab"
   $DRY_RUN && sed 's/^/    /' "$FSTAB_NEW"
   ok "added ${FSTAB_ADDED} fstab entries"
