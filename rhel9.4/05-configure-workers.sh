@@ -285,7 +285,7 @@ if $DO_METER; then
     warn "That is only safe if the hostname is stable across reboots AND distinct from every other node."
   fi
 
-  METER_NODE_ID=$(grep -E '^METERING_NODE_ID=..*' "$APP_ROOT/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"' ')
+  METER_NODE_ID=$(grep -E '^METERING_NODE_ID=..*' "$APP_ROOT/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"' ' || true)
   METER_NODE_ID="${METER_NODE_ID:-$(hostname)}"
 
   # Both watchdogs are OFF unless configured, and both used to be off silently.

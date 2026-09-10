@@ -251,7 +251,7 @@ pm.max_requests = 500
 slowlog = /var/log/php-fpm/www-slow.log
 request_slowlog_timeout = 10s
 
-; A worker blocked on a stalled NFS mount never returns on its own — `hard`
+; A worker blocked on a stalled NFS mount never returns on its own — "hard"
 ; mounts retry indefinitely by design. Without a ceiling, one stall walks the
 ; whole pool into a permanent wedge that no health check can see, because the
 ; workers are alive and simply never answer. This kills such a request and logs
@@ -666,7 +666,7 @@ ${METER_ACCESS_LOG}
         # content digest. Note the one-way door: these URLs cannot be recalled
         # once a visitor has them, which is why old build directories are kept
         # for a grace window after they stop being referenced and are removed
-        # only by an operator running `php artisan theme:assets-gc --force`.
+        # only by an operator running \`php artisan theme:assets-gc --force\`.
         expires 1y;
         add_header Cache-Control "public, max-age=31536000, immutable" always;
 
@@ -677,8 +677,8 @@ ${METER_ACCESS_LOG}
         # reproduce the cost this whole change exists to remove.
         try_files \$uri =404;
 
-        # error_page is inherited from the server block, where `error_page 404
-        # /index.php;` sends misses to Laravel. That inheritance defeats the
+        # error_page is inherited from the server block, where \`error_page 404
+        # /index.php;\` sends misses to Laravel. That inheritance defeats the
         # =404 above: a miss here would boot the framework, which is exactly the
         # cost this location exists to avoid, and the deploy probe cannot detect
         # it because Laravel also answers 404. Reset it to nginx's own page.
