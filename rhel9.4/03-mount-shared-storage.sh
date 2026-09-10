@@ -371,6 +371,7 @@ reflects() {
 }
 
 STALE_REMOUNTED=0
+UNWRITABLE=()
 
 for m in "${MAPPINGS[@]}"; do
   IFS='|' read -r src tgt label writer seed <<< "$m"
@@ -408,6 +409,27 @@ for m in "${MAPPINGS[@]}"; do
     else
       die "cannot bind a source that does not exist: $src"
     fi
+  fi
+
+  # The app user must be able to WRITE to the source before anything else
+  # happens. On a first run this mounted an unwritable, empty directory the
+  # storage team had created as root over 53 local themes, then reported the
+  # write failure at the end — with the site already serving without themes.
+  # Nothing is hidden and nothing is written to fstab until every source
+  # passes this.
+  wprobe=".writeprobe.$$"
+  if [[ ! -d "$src" ]]; then
+    # Only reachable under --dry-run: the create above was printed, not done.
+    ok "(dry-run) ${src} would be created by ${APP_USER}; write check skipped"
+  elif sudo -u "$APP_USER" touch "${src}/${wprobe}" 2>/dev/null; then
+    sudo -u "$APP_USER" rm -f "${src}/${wprobe}"
+  else
+    printf '\n'
+    warn "${APP_USER} cannot write to ${src}:"
+    ls -ldn "$src" 2>/dev/null | sed 's/^/    /' || true
+    printf '    %s\n' "$(id "$APP_USER")"
+    UNWRITABLE+=("$src")
+    continue   # no seeding, no hiding checks — this run stops before fstab anyway
   fi
 
   # Only CREATE a missing target. /var/log/nginx and /var/log/php-fpm exist
@@ -476,6 +498,27 @@ for m in "${MAPPINGS[@]}"; do
     confirm "Continue?" || die "aborted"
   fi
 done
+
+if (( ${#UNWRITABLE[@]} > 0 )); then
+  cat >&2 <<UNWRITABLE_MSG
+
+[fail] ${APP_USER} cannot write to ${#UNWRITABLE[@]} source director$( (( ${#UNWRITABLE[@]} == 1 )) && printf 'y' || printf 'ies' ) on the share.
+       Nothing was mounted and fstab was not touched: mounting now would hide
+       the local content under an unwritable directory and every upload would
+       fail.
+
+       Fix the ownership ON THE NFS SERVER (the storage team), to the uid:gid
+       of ${APP_USER} on the web nodes — $(id -u "$APP_USER"):$(id -g "$APP_GROUP") — for:
+$(printf '           %s\n' "${UNWRITABLE[@]}")
+
+       If ${EXPORT_ROOT} itself is writable by ${APP_USER} and the directories
+       are empty, recreating them from this node also works:
+           sudo -u ${APP_USER} sh -c 'cd ${EXPORT_ROOT} && mv <dir> <dir>.old && mkdir <dir>'
+
+       Then re-run this script.
+UNWRITABLE_MSG
+  exit 1
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 log "5/7  Write fstab entries"
