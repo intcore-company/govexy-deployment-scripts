@@ -25,7 +25,8 @@ them away.
 
 | File | Purpose |
 |---|---|
-| `govexy-node.conf` | Shared variables, including `NODE_ROLE`. Sourced or read by every script. **Edit here, never inside the scripts.** |
+| `govexy-node.conf.example` | Template for the shared variables, including `NODE_ROLE`. **Tracked.** Copy it to `govexy-node.conf` on the node. |
+| `govexy-node.conf` | The live configuration. **Git-ignored, never committed** — it carries the estate's addresses and this repository is public. Sourced or read by every script. **Edit here, never inside the scripts.** |
 | `01-install-dependencies.sh` | Stage 1 — install only. Repos, packages, PHP 8.4, Composer. Starts no services. No prompts. |
 | `02-configure-nginx-php.sh` | Stage 2 — configuration. FPM pool, php.ini, nginx vhost, SELinux, firewalld; starts and verifies services. Also `--set-lb` mode. **Prompts for confirmation.** |
 | `03-mount-shared-storage.sh` | Stage 3 — bind the three shared paths out of the NFS export onto the application. Interactive; `--dry-run` and `--verify` modes. |
@@ -82,6 +83,17 @@ Known-blocked on this estate, and deliberately routed around:
 ---
 
 ## 3. Configuration — `govexy-node.conf`
+
+The tracked file is `govexy-node.conf.example`; `govexy-node.conf` is git-ignored
+because it holds the Redis and load-balancer addresses and this repository is public.
+Stages 1 and 2 refuse to run until it exists:
+
+```bash
+cp govexy-node.conf.example govexy-node.conf
+```
+
+A node that already has a `govexy-node.conf` keeps it across `git pull`; diff it against
+the example after pulling to pick up new keys.
 
 Every variable is listed. Stages 1 and 2 `source` this file, so a syntax error here
 breaks both; stages 3, 4 and 5 read individual keys out of it with `grep`.
@@ -219,10 +231,12 @@ node; 5 runs once per node after the first deploy.
 | 5 | `05-configure-workers.sh` | once, after the first deploy | scheduler on the primary only; Horizon and the meter ingest everywhere |
 
 Copy the whole directory to the node (the whole directory, not a subset — the scripts
-resolve `govexy-node.conf` relative to their own path), edit `govexy-node.conf`, then:
+resolve `govexy-node.conf` relative to their own path), create `govexy-node.conf` from the
+template and edit it:
 
 ```bash
 cd /root/govexy-deployment-scripts/rhel9.4
+cp govexy-node.conf.example govexy-node.conf
 vim govexy-node.conf
 ```
 
@@ -351,7 +365,12 @@ grep -E '^(APP_ENV|APP_DEBUG|TELESCOPE_ENABLED|LICENSE_MODE)=' /var/www/govexy/.
 | `TELESCOPE_ENABLED` | `false` | **Most likely to be missing.** `config/telescope.php` defaults it to `true`, and `laravel/telescope` is in `require`, so `--no-dev` leaves it installed. The UI is gated but the *recording* is not: every request, query, job and payload is written to `telescope_entries`, unbounded, on government data. It is absent from older `.env` files, so add it. |
 | `LICENSE_MODE` | present (`onprem`) | `onprem` and `saas` are different products. |
 
-Four other changes affect an existing estate:
+Five other changes affect an existing estate:
+
+- **`govexy-node.conf` is no longer tracked.** The repository ships
+  `govexy-node.conf.example`; a node that pulls this version keeps its existing
+  `govexy-node.conf` untouched (it is git-ignored), and a fresh clone must copy the example
+  before stage 1 or 2 will run.
 
 - **`PHP_POST_MAX`** is new in `govexy-node.conf`. A conf written before it existed still
   works — stage 2 derives `PHP_UPLOAD_MAX + 8M` — but set it explicitly if you want a

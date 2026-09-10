@@ -18,7 +18,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=govexy-node.conf
+[[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] || {
+  printf '\033[1;31m[fail]\033[0m %s\n' \
+    "${SCRIPT_DIR}/govexy-node.conf not found. It is git-ignored: cp govexy-node.conf.example govexy-node.conf, then edit it." >&2
+  exit 1
+}
+# shellcheck source=govexy-node.conf.example
 source "${SCRIPT_DIR}/govexy-node.conf"
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
