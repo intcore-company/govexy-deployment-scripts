@@ -2,8 +2,11 @@
 #
 # GovExy web node — STAGE 3: shared storage bind mounts
 #
-# Interactive. Discovers mounted NFS exports, asks which one backs this
-# installation, then binds three of its subdirectories onto the application:
+# Interactive, with every answer defaulting to govexy-node.conf (NFS_EXPORT_ROOT,
+# NFS_SUB_*, NFS_BIND_LOGS, NODE_HOSTNAME, APP_ROOT) — a node with a complete
+# conf is re-run by pressing Enter. Without NFS_EXPORT_ROOT it discovers the
+# mounted NFS exports and asks. It binds three subdirectories of the export
+# onto the application:
 #
 #     <export>/<media>    ->  <APP_ROOT>/storage/app/public    dashboard uploads
 #     <export>/<private>  ->  <APP_ROOT>/storage/app/private   form attachments
@@ -23,6 +26,10 @@
 # step 7 probes exactly that before declaring success.
 #
 # Idempotent: safe to re-run. Existing fstab entries are detected, not duplicated.
+# After the export MOVES, re-running is the migration: a target that is mounted
+# from somewhere other than its source is unmounted and rebound, and its fstab
+# line is rewritten. Stop nginx, php-fpm and Horizon first so the unmounts are
+# not refused as busy.
 #
 # Usage:
 #   bash 03-mount-shared-storage.sh              interactive
@@ -93,67 +100,99 @@ confirm() {
 [[ $EUID -eq 0 ]] || die "must run as root"
 $DRY_RUN && log "DRY RUN — nothing will be changed"
 
+# ── govexy-node.conf ────────────────────────────────────────────────────────
+#
+# Read by key, not sourced: a syntax error in the conf must not take this
+# script down with it. Every value the script asks for defaults to the conf,
+# so a node whose conf is complete is re-run by pressing Enter through it.
+#
+# dirname, not ${BASH_SOURCE%/*}: invoked as `bash 03-mount-shared-storage.sh`
+# BASH_SOURCE has no slash, the %/* expansion is a no-op, and the probe path
+# became "03-mount-shared-storage.sh/govexy-node.conf" — the conf was never read.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONF="${SCRIPT_DIR}/govexy-node.conf"
+
+conf_get() {   # conf_get KEY DEFAULT
+  local v=""
+  [[ -f "$CONF" ]] && v=$(grep -E "^$1=" "$CONF" 2>/dev/null | head -1 \
+    | cut -d= -f2- | tr -d '"' | awk '{print $1}') || true
+  printf '%s' "${v:-$2}"
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
-log "1/7  Discover mounted NFS exports"
+log "1/7  Shared storage root"
 # ═════════════════════════════════════════════════════════════════════════════
 
 mapfile -t NFS_MOUNTS < <(findmnt -rn -t nfs,nfs4 -o TARGET 2>/dev/null | sort -u)
 
-if (( ${#NFS_MOUNTS[@]} == 0 )); then
-  die "No NFS mount found.
+printf '\n'
+findmnt -t nfs,nfs4 -o TARGET,SOURCE,SIZE,AVAIL 2>/dev/null || \
+  df -hT -t nfs -t nfs4 2>/dev/null || true
+
+EXPORT_ROOT=$(conf_get NFS_EXPORT_ROOT "")
+EXPORT_ROOT="${EXPORT_ROOT%/}"
+
+if [[ -n "$EXPORT_ROOT" ]]; then
+  # The conf names it: no discovery, no prompt. Check it is really there.
+  [[ -d "$EXPORT_ROOT" ]] || die "NFS_EXPORT_ROOT=${EXPORT_ROOT} in govexy-node.conf is not a directory.
+
+       Has the storage team mounted the export on this node yet?
+           findmnt -t nfs,nfs4"
+  if ! findmnt -rn -t nfs,nfs4 -o TARGET | grep -qx "$EXPORT_ROOT"; then
+    warn "NFS_EXPORT_ROOT=${EXPORT_ROOT} is not itself an NFS mount point."
+    confirm "Continue with it anyway?" || die "aborted"
+  fi
+  ok "Shared storage root (from govexy-node.conf): $EXPORT_ROOT"
+else
+  if (( ${#NFS_MOUNTS[@]} == 0 )); then
+    die "No NFS mount found.
 
        The storage team mounts the export; this script only binds parts of it
        into the application. Check with:
            findmnt -t nfs,nfs4
            df -hT -t nfs -t nfs4"
-fi
-
-printf '\n'
-findmnt -t nfs,nfs4 -o TARGET,SOURCE,SIZE,AVAIL 2>/dev/null || \
-  df -hT -t nfs -t nfs4
-
-EXPORT_ROOT=""
-if (( ${#NFS_MOUNTS[@]} == 1 )); then
-  EXPORT_ROOT="${NFS_MOUNTS[0]}"
-  printf '\n'
-  confirm "Use ${EXPORT_ROOT} as the GovExy shared storage root?" \
-    || EXPORT_ROOT=""
-fi
-
-if [[ -z "$EXPORT_ROOT" ]]; then
-  printf '\nMounted NFS exports:\n'
-  idx=1
-  for m in "${NFS_MOUNTS[@]}"; do
-    printf '  %d) %s\n' "$idx" "$m"
-    idx=$((idx + 1))
-  done
-  choice=$(ask "Which one backs this installation? (number, or full path)")
-  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#NFS_MOUNTS[@]} )); then
-    EXPORT_ROOT="${NFS_MOUNTS[$((choice - 1))]}"
-  else
-    EXPORT_ROOT="$choice"
   fi
+
+  if (( ${#NFS_MOUNTS[@]} == 1 )); then
+    EXPORT_ROOT="${NFS_MOUNTS[0]}"
+    printf '\n'
+    confirm "Use ${EXPORT_ROOT} as the GovExy shared storage root?" \
+      || EXPORT_ROOT=""
+  fi
+
+  if [[ -z "$EXPORT_ROOT" ]]; then
+    printf '\nMounted NFS exports:\n'
+    idx=1
+    for m in "${NFS_MOUNTS[@]}"; do
+      printf '  %d) %s\n' "$idx" "$m"
+      idx=$((idx + 1))
+    done
+    choice=$(ask "Which one backs this installation? (number, or full path)")
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#NFS_MOUNTS[@]} )); then
+      EXPORT_ROOT="${NFS_MOUNTS[$((choice - 1))]}"
+    else
+      EXPORT_ROOT="$choice"
+    fi
+  fi
+
+  [[ -d "$EXPORT_ROOT" ]] || die "not a directory: $EXPORT_ROOT"
+  findmnt -rn -t nfs,nfs4 -o TARGET | grep -qx "$EXPORT_ROOT" \
+    || warn "$EXPORT_ROOT is not itself an NFS mount point — continuing, but confirm this is intended"
+
+  ok "Shared storage root: $EXPORT_ROOT"
+  warn "Record it as NFS_EXPORT_ROOT=\"${EXPORT_ROOT}\" in govexy-node.conf so re-runs need no discovery."
 fi
 
-[[ -d "$EXPORT_ROOT" ]] || die "not a directory: $EXPORT_ROOT"
-findmnt -rn -t nfs,nfs4 -o TARGET | grep -qx "$EXPORT_ROOT" \
-  || warn "$EXPORT_ROOT is not itself an NFS mount point — continuing, but confirm this is intended"
-
-ok "Shared storage root: $EXPORT_ROOT"
+# A soft NFS mount returns I/O errors on server hiccups, which surface as
+# truncated uploads. The storage team's line, not ours — but say it.
+findmnt -rn -o OPTIONS "$EXPORT_ROOT" 2>/dev/null | tr ',' '\n' | grep -qx soft \
+  && warn "${EXPORT_ROOT} is mounted 'soft' — NFS-SHARED-STORAGE.md §4 asks for 'hard'"
 
 # ═════════════════════════════════════════════════════════════════════════════
 log "2/7  Application root"
 # ═════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_APP_ROOT="/var/www/govexy"
-# dirname, not ${BASH_SOURCE%/*}: invoked as `bash 03-mount-shared-storage.sh`
-# BASH_SOURCE has no slash, the %/* expansion is a no-op, and the probe path
-# became "03-mount-shared-storage.sh/govexy-node.conf" — the conf was never read.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-[[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
-  DEFAULT_APP_ROOT=$(grep -E '^APP_ROOT=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
-    | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}') || true
-DEFAULT_APP_ROOT="${DEFAULT_APP_ROOT:-/var/www/govexy}"
+DEFAULT_APP_ROOT=$(conf_get APP_ROOT /var/www/govexy)
 
 APP_ROOT=$(ask "Application root" "$DEFAULT_APP_ROOT")
 APP_ROOT="${APP_ROOT%/}"
@@ -173,9 +212,9 @@ printf '\nContents of %s:\n' "$EXPORT_ROOT"
 ls -1 "$EXPORT_ROOT" 2>/dev/null | sed 's/^/  /' || true
 printf '\n'
 
-SUB_MEDIA=$(ask   "Subdirectory for dashboard media"    "media")
-SUB_PRIVATE=$(ask "Subdirectory for form attachments"   "private")
-SUB_THEMES=$(ask  "Subdirectory for uploaded themes"    "themes")
+SUB_MEDIA=$(ask   "Subdirectory for dashboard media"    "$(conf_get NFS_SUB_MEDIA   media)")
+SUB_PRIVATE=$(ask "Subdirectory for form attachments"   "$(conf_get NFS_SUB_PRIVATE private)")
+SUB_THEMES=$(ask  "Subdirectory for uploaded themes"    "$(conf_get NFS_SUB_THEMES  themes)")
 
 # source|target|label|writer|seed
 #
@@ -202,20 +241,23 @@ MAPPINGS=(
 # hostname. It must differ between the two nodes — a copied conf with the same
 # NODE_HOSTNAME on both would put both nodes into one directory, which is the
 # exact failure the per-node layout exists to prevent. Step 4 checks for that.
-NODE_NAME=""
-[[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
-  NODE_NAME=$(grep -E '^NODE_HOSTNAME=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
-    | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}') || true
+NODE_NAME=$(conf_get NODE_HOSTNAME "")
 NODE_NAME="${NODE_NAME%%.*}"
 NODE_NAME="${NODE_NAME:-$(hostname -s)}"
 
 LOG_TARGETS=("${APP_ROOT}/storage/logs" /var/log/nginx /var/log/php-fpm)
 BIND_LOGS=false
+CONF_BIND_LOGS=$(conf_get NFS_BIND_LOGS "")
 if $VERIFY_ONLY; then
   # No prompt in verify mode: include the log binds if any of them is mounted.
   for t in "${LOG_TARGETS[@]}"; do
     findmnt -rn "$t" &>/dev/null && BIND_LOGS=true
   done
+elif [[ "$CONF_BIND_LOGS" == "yes" ]]; then
+  BIND_LOGS=true
+  ok "per-node log binds: on (NFS_BIND_LOGS=yes in govexy-node.conf)"
+elif [[ "$CONF_BIND_LOGS" == "no" ]]; then
+  ok "per-node log binds: off (NFS_BIND_LOGS=no in govexy-node.conf)"
 else
   printf '\n'
   if confirm "Also bind this node's logs (Laravel, nginx, php-fpm) to a per-node directory on the share?"; then
@@ -223,10 +265,10 @@ else
   fi
 fi
 
-SUB_LOGS="logs"
+SUB_LOGS=$(conf_get NFS_SUB_LOGS logs)
 if $BIND_LOGS; then
   if ! $VERIFY_ONLY; then
-    SUB_LOGS=$(ask  "Subdirectory for per-node logs"        "logs")
+    SUB_LOGS=$(ask  "Subdirectory for per-node logs"        "$SUB_LOGS")
     NODE_NAME=$(ask "Name of THIS node (its log directory)" "$NODE_NAME")
   fi
   [[ "$NODE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "node name must be a plain directory name: '$NODE_NAME'"
@@ -314,12 +356,50 @@ mkdir_on_share() {
   fi
 }
 
+# Does what is mounted at TGT actually reflect SRC? Write a probe on the
+# share as the app user and look for it through the mount.
+#   0  same content — the bind is the one we want
+#   1  different — a bind from a previous export, or a manual mount
+#   2  cannot tell — the app user cannot write to SRC
+reflects() {
+  local src=$1 tgt=$2 probe=".reflectprobe.$$" rc=2
+  if sudo -u "$APP_USER" touch "${src}/${probe}" 2>/dev/null; then
+    [[ -e "${tgt}/${probe}" ]] && rc=0 || rc=1
+    sudo -u "$APP_USER" rm -f "${src}/${probe}"
+  fi
+  return $rc
+}
+
+STALE_REMOUNTED=0
+
 for m in "${MAPPINGS[@]}"; do
   IFS='|' read -r src tgt label writer seed <<< "$m"
 
+  # Already mounted is not the same as mounted from the RIGHT place. After the
+  # export moves, every target is still "mounted" — from the old export. Re-
+  # running used to skip them here and then report MISMATCH at the end, having
+  # changed nothing. Now a stale bind is unmounted and rebuilt below.
   if findmnt -rn "$tgt" &>/dev/null; then
-    ok "already mounted, skipping checks: $tgt"
-    continue
+    rc=1
+    if [[ -d "$src" ]]; then
+      rc=0; reflects "$src" "$tgt" || rc=$?
+    fi
+    if (( rc == 0 )); then
+      ok "already mounted from ${src}: $tgt"
+      continue
+    elif (( rc == 2 )); then
+      warn "$tgt is mounted, but ${APP_USER} cannot write to ${src} to check it is the same — leaving it"
+      continue
+    fi
+    printf '\n'
+    warn "$tgt is mounted, but NOT from ${src}."
+    warn "That is a bind from a previous export (or a manual mount). It will be replaced."
+    findmnt -o TARGET,SOURCE,FSTYPE "$tgt" 2>/dev/null | sed 's/^/    /' || true
+    confirm "Unmount ${tgt} and rebind it from ${src}?" \
+      || die "aborted — ${tgt} still points at the old location"
+    run "umount '$tgt'" \
+      || die "umount ${tgt} failed — busy? Stop nginx, php-fpm and govexy-horizon, then re-run."
+    STALE_REMOUNTED=1
   fi
 
   if [[ ! -d "$src" ]]; then
@@ -407,7 +487,9 @@ FSTAB_ADDED=0
 # operation. A sequence of `printf >> /etc/fstab` inside run "..." strings is one
 # interrupted redirect away from a truncated fstab, and an unbootable node.
 FSTAB_NEW=$(mktemp)
-trap 'rm -f "$FSTAB_NEW"' EXIT
+FSTAB_TMP=$(mktemp)
+FSTAB_REWRITE=()
+trap 'rm -f "$FSTAB_NEW" "$FSTAB_TMP"' EXIT
 
 {
   printf '\n# GovExy shared storage — bind mounts from %s\n' "$EXPORT_ROOT"
@@ -433,9 +515,16 @@ for m in "${MAPPINGS[@]}"; do
   # By field, not by delimiter: a hand-written line mixing tabs and spaces
   # around the target defeated both fixed-string greps, and the duplicate bind
   # was appended — mount -a then stacks it.
-  if awk -v t="$tgt" '!/^[[:space:]]*#/ && $2 == t { found=1 } END { exit !found }' /etc/fstab; then
-    ok "fstab entry already present: $tgt"
-    continue
+  existing_src=$(awk -v t="$tgt" '!/^[[:space:]]*#/ && $2 == t { print $1; exit }' /etc/fstab)
+  if [[ -n "$existing_src" ]]; then
+    if [[ "$existing_src" == "$src" ]]; then
+      ok "fstab entry already present: $tgt"
+      continue
+    fi
+    # Same target, different source: the line from before the export moved.
+    # It is dropped from fstab and the fresh line appended with the others.
+    warn "fstab binds ${tgt} from ${existing_src} — replacing with ${src}"
+    FSTAB_REWRITE+=("$tgt")
   fi
 
   printf '%s  %s  none  bind,nofail,_netdev,x-systemd.requires-mounts-for=%s  0 0\n' \
@@ -450,6 +539,11 @@ if (( FSTAB_ADDED > 0 )); then
   # modified fstab.
   fstab_bak="/etc/fstab.bak.$(date +%s)"
   run "cp -a /etc/fstab '$fstab_bak'"
+  # Stale lines out first. Written through a temp file and copied back over
+  # /etc/fstab (cat >, not mv) so the inode, mode and SELinux label survive.
+  for t in ${FSTAB_REWRITE[@]+"${FSTAB_REWRITE[@]}"}; do
+    run "awk -v t='$t' '!/^[[:space:]]*#/ && \$2 == t { next } { print }' /etc/fstab > '$FSTAB_TMP' && cat '$FSTAB_TMP' > /etc/fstab"
+  done
   run "cat '$FSTAB_NEW' >> /etc/fstab"
   $DRY_RUN && sed 's/^/    /' "$FSTAB_NEW"
   ok "added ${FSTAB_ADDED} fstab entries"
@@ -490,7 +584,7 @@ fi
 # are in place: nginx and php-fpm reopen on reload, Horizon is long-lived and
 # holds laravel.log open, so terminate it and let its unit restart it. Only
 # when a log bind was actually added this run.
-if $BIND_LOGS && (( FSTAB_ADDED > 0 )); then
+if $BIND_LOGS && (( FSTAB_ADDED > 0 || STALE_REMOUNTED > 0 )); then
   log "6b/7  Reopen log files"
   if systemctl is-active --quiet nginx; then
     run "nginx -t && systemctl reload nginx" \

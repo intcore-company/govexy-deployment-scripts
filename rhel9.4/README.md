@@ -160,6 +160,21 @@ every entry as IPv4 and dies on a malformed one.
 |---|---|---|---|
 | `APP_ROOT` | yes | `/var/www/govexy` | Laravel root. Stage 2 creates it and `${APP_ROOT}/public` owned by `nginx:nginx`, sets SELinux fcontexts under it, and points the nginx `root` at `${APP_ROOT}/public`. Changing it after deployment means redoing the fcontext rules. |
 
+### Shared storage (stage 3)
+
+| Variable | Required | Default | Effect |
+|---|---|---|---|
+| `NFS_EXPORT_ROOT` | no | `""` | The mount point of the NFS export on this node (the TARGET of `findmnt -t nfs,nfs4`, e.g. `/govexy`). Set: stage 3 skips discovery and uses it. Empty: stage 3 lists the mounted exports and asks. **Change it when the export moves and re-run stage 3** — stale binds are unmounted, their fstab lines rewritten, and rebound. |
+| `NFS_SUB_MEDIA` | no | `media` | `<export>/<this>` → `storage/app/public`. |
+| `NFS_SUB_PRIVATE` | no | `private` | `<export>/<this>` → `storage/app/private`. |
+| `NFS_SUB_THEMES` | no | `themes` | `<export>/<this>` → `resources/themes`. |
+| `NFS_BIND_LOGS` | no | `""` | `yes` binds this node's logs to `<export>/<NFS_SUB_LOGS>/<node>/` without asking, `no` skips without asking, empty asks. See the per-node logs section under Stage 3, including the root-squash requirement on the export. |
+| `NFS_SUB_LOGS` | no | `logs` | Parent directory of the per-node log directories. |
+
+Every stage 3 prompt defaults to these, so a node whose conf is complete is re-run by
+pressing Enter through it. The confirmations that guard data (seeding, hiding content,
+replacing a stale bind) still ask.
+
 ### Install options
 
 | Variable | Required | Default | Effect |
@@ -320,33 +335,28 @@ Two things to know before saying yes:
 The meter log `/var/log/govexy-meter` stays local on purpose: stage 5 drains it per node
 with a per-node cursor.
 
-**Moving to a different NFS export.** Re-running the script does **not** migrate: the
-export root is discovered from what is mounted, an fstab entry that already exists for a
-target is kept as-is, and a target that is already mounted is skipped. Step 7 will report
-`MISMATCH` against the new export, but nothing is changed. Migrate by hand, then re-run:
+**Moving to a different NFS export.** Re-running the script *is* the migration. A target
+that is mounted from somewhere other than its source is unmounted and rebound (after a
+confirmation), and its fstab line is rewritten. The unmounts need the writers stopped, or
+they are refused as busy:
 
 ```bash
-# 1. stop the writers
+# 1. the storage team mounts the new export and confirms it already holds
+#    media, private and themes copied from the old one
+
+# 2. point the conf at it
+vim govexy-node.conf                       # NFS_EXPORT_ROOT="/govexy"
+
+# 3. stop the writers, re-run, start them
 systemctl stop nginx php-fpm govexy-horizon
-
-# 2. drop the old binds and their fstab lines
-umount /var/www/govexy/storage/app/public /var/www/govexy/storage/app/private \
-       /var/www/govexy/resources/themes
-# plus the three log binds if they were set up:
-#   umount /var/www/govexy/storage/logs /var/log/nginx /var/log/php-fpm
-cp -a /etc/fstab /etc/fstab.bak.$(date +%s)
-sed -i -e '/^# GovExy shared storage/,/^#     findmnt /d' \
-       -e '/x-systemd.requires-mounts-for=/d' /etc/fstab     # the block the script wrote
-# (check with: grep -n govexy /etc/fstab — nothing should remain)
-
-# 3. the storage team swaps the NFS mount itself (old export out, new export in)
-
-# 4. seed the new export from the old one once, from one node, as the app user,
-#    or have the storage team copy it — then re-run stage 3 on every node
-bash 03-mount-shared-storage.sh --dry-run
+bash 03-mount-shared-storage.sh --dry-run  # shows which binds are stale
 bash 03-mount-shared-storage.sh
 systemctl start php-fpm nginx govexy-horizon
+bash 03-mount-shared-storage.sh --verify
 ```
+
+The script does not touch the NFS mount line itself (`server:/export  /govexy  nfs …`);
+that is the storage team's, and stays in fstab.
 
 ### Stage 4 — deploy a release
 
@@ -447,9 +457,10 @@ Six other changes affect an existing estate:
   first `git pull` removes it (or refuses to run over local edits) — back it up and restore
   it as shown in §3. Without it stages 1 and 2 refuse to run, and stages 3, 4 and 5 fall
   back silently to defaults: `APP_ROOT=/var/www/govexy`, `NODE_ROLE=secondary`, tests on.
-- **A changed NFS export is not picked up by re-running stage 3.** The export root is
-  discovered from what is mounted, not read from the conf, and an existing fstab entry for
-  a target is kept as-is, not rewritten. Follow the migration steps under Stage 3.
+- **Stage 3 reads its answers from the conf** (`NFS_EXPORT_ROOT`, `NFS_SUB_*`,
+  `NFS_BIND_LOGS`) and replaces stale binds when the export has moved. Set
+  `NFS_EXPORT_ROOT` on an existing node and re-run; see "Moving to a different NFS
+  export" under Stage 3.
 
 - **`PHP_POST_MAX`** is new in `govexy-node.conf`. A conf written before it existed still
   works — stage 2 derives `PHP_UPLOAD_MAX + 8M` — but set it explicitly if you want a
