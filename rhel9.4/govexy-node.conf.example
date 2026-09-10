@@ -108,6 +108,10 @@ PHP_POST_MAX="160M"
 FPM_MAX_CHILDREN="50"
 
 # ── Firewall ─────────────────────────────────────────────────────────────────
+# FIREWALL: "yes" = stage 2 manages firewalld and starts it if it is down;
+#           "no"  = stage 2 never touches the firewall (RESTRICT_HTTP_TO_LB is
+#                   then NOT enforced by this node); empty = ask if it is down.
+FIREWALL=""
 RESTRICT_HTTP_TO_LB="no"               # "yes" = only LB_IPS may reach :80 (needs LB_IPS)
 
 # ── Security headers ─────────────────────────────────────────────────────────

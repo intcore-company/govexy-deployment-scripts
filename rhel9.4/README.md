@@ -197,6 +197,7 @@ replacing a stale bind) still ask.
 
 | Variable | Required | Default | Effect |
 |---|---|---|---|
+| `FIREWALL` | no | `""` | `yes`: stage 2 manages firewalld and starts it if it is down. `no`: stage 2 never touches the firewall, and `RESTRICT_HTTP_TO_LB` is then not enforced by this node. Empty: stage 2 asks when firewalld is down, and continues either way. |
 | `RESTRICT_HTTP_TO_LB` | yes | `no` | `no` opens the `http` and `https` firewalld services to everyone. `yes` removes both and instead adds a rich rule accepting `http` only from each `LB_IPS/32`. Stage 2 **dies** if this is `yes` while `LB_IPS` is empty — that combination would firewall the node off from everything. |
 
 ### Bandwidth meter log

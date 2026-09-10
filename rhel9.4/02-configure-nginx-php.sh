@@ -785,31 +785,53 @@ log "5/6  Firewall"
 # Stage 1 enables firewalld, but a node where it was stopped since (or that
 # skipped stage 1) reached here and died on the first firewall-cmd with nothing
 # but "FirewallD is not running" — before step 6, so the pool and vhost just
-# written were never reloaded. With RESTRICT_HTTP_TO_LB=yes the restriction
-# cannot exist without firewalld, so it is started; the default public zone
-# keeps ssh open and nothing this node needs is inbound apart from :80.
-if ! systemctl is-active --quiet firewalld; then
-  warn "firewalld is not running. RESTRICT_HTTP_TO_LB=${RESTRICT_HTTP_TO_LB} needs it to hold any rule at all."
-  read -r -p "Start and enable firewalld now? [y/N] " fwconfirm \
-    || die "no terminal to confirm on (non-interactive run). Run it under tmux."
-  [[ "$fwconfirm" == [yY] ]] || die "firewalld is required for the firewall step. Start it and re-run:
-       systemctl enable --now firewalld"
-  systemctl enable --now firewalld
-  firewall-cmd --state
+# written were never reloaded.
+#
+# FIREWALL in govexy-node.conf decides:
+#   yes    manage firewalld; if it is down, start and enable it
+#   no     leave the firewall alone entirely (another tier or a host policy owns it)
+#   empty  ask, when firewalld is down
+# The default public zone keeps ssh open; nothing this node needs is inbound
+# apart from :80, which the rules below open (to LB_IPS only when restricted).
+FIREWALL="${FIREWALL:-}"
+MANAGE_FIREWALL=true
+
+if [[ "$FIREWALL" == "no" ]]; then
+  MANAGE_FIREWALL=false
+  warn "FIREWALL=no in govexy-node.conf — firewall step skipped. RESTRICT_HTTP_TO_LB=${RESTRICT_HTTP_TO_LB} is NOT enforced by this node."
+elif ! systemctl is-active --quiet firewalld; then
+  if [[ "$FIREWALL" == "yes" ]]; then
+    log "firewalld is not running — starting it (FIREWALL=yes)"
+    systemctl enable --now firewalld
+  else
+    warn "firewalld is not running. Without it, RESTRICT_HTTP_TO_LB=${RESTRICT_HTTP_TO_LB} holds no rule at all"
+    warn "and port 80 is open to whoever can reach the node."
+    read -r -p "Start and enable firewalld, and apply the rules? [y/N] " fwconfirm \
+      || die "no terminal to confirm on (non-interactive run). Run it under tmux."
+    if [[ "$fwconfirm" == [yY] ]]; then
+      systemctl enable --now firewalld
+    else
+      MANAGE_FIREWALL=false
+      warn "firewall step skipped — record it as FIREWALL=\"no\" in govexy-node.conf if that is the standing decision."
+    fi
+  fi
 fi
 
-if [[ "$RESTRICT_HTTP_TO_LB" == "yes" ]]; then
-  firewall-cmd --permanent --remove-service=http  &>/dev/null || true
-  firewall-cmd --permanent --remove-service=https &>/dev/null || true
-  for ip in $LB_IPS; do
-    firewall-cmd --permanent \
-      --add-rich-rule="rule family=\"ipv4\" source address=\"${ip}/32\" service name=\"http\" accept"
-  done
-else
-  firewall-cmd --permanent --add-service=http
-  firewall-cmd --permanent --add-service=https
+if $MANAGE_FIREWALL; then
+  firewall-cmd --state
+  if [[ "$RESTRICT_HTTP_TO_LB" == "yes" ]]; then
+    firewall-cmd --permanent --remove-service=http  &>/dev/null || true
+    firewall-cmd --permanent --remove-service=https &>/dev/null || true
+    for ip in $LB_IPS; do
+      firewall-cmd --permanent \
+        --add-rich-rule="rule family=\"ipv4\" source address=\"${ip}/32\" service name=\"http\" accept"
+    done
+  else
+    firewall-cmd --permanent --add-service=http
+    firewall-cmd --permanent --add-service=https
+  fi
+  firewall-cmd --reload
 fi
-firewall-cmd --reload
 
 # ═════════════════════════════════════════════════════════════════════════════
 log "6/6  Services + verification"
