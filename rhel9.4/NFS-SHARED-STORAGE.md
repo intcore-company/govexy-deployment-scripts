@@ -32,6 +32,24 @@ read-only, replaceable code. Two consequences:
 
 Confirm the deploy method before the first release, not after.
 
+### Optional: per-node logs
+
+Not shared in the sense above — **one directory per node**, on the same export, so that
+both nodes' logs can be read from one place. Two nodes appending to the same file over NFS
+interleave and corrupt entries (§2), so the layout is `<export>/logs/<node>/…` and each
+node binds only its own directory:
+
+| On the node | On the share |
+|---|---|
+| `/var/www/govexy/storage/logs` | `<export>/logs/<node>/laravel` |
+| `/var/log/nginx` | `<export>/logs/<node>/nginx` |
+| `/var/log/php-fpm` | `<export>/logs/<node>/php-fpm` |
+
+`03-mount-shared-storage.sh` sets this up when asked. It needs one thing from the export
+that the three data paths do not: **root must be able to write** under `logs/<node>/nginx`
+and `logs/<node>/php-fpm`, because both masters open their log files as root before
+dropping privileges. See §3.
+
 ### One path not decided here: `storage/app/themes`
 
 Several parts of the application write under `storage/app/themes` (the theme preview and
@@ -55,7 +73,7 @@ Putting these on NFS causes real damage, not just slowness.
 | `storage/framework/cache` | File cache. Redis handles caching; this is only a fallback and must never be shared. |
 | `storage/framework/sessions` | Unused (sessions are in Redis), but shared file sessions would deadlock on NFS locking. |
 | `bootstrap/cache` | Compiled config/routes/services. Node-local by design; regenerated per node at deploy. |
-| `storage/logs` | Two nodes appending to one file interleave and corrupt entries. Keep per-node, ship to a central collector if aggregation is needed. |
+| `storage/logs` — **as one shared directory** | Two nodes appending to one file interleave and corrupt entries. Per node it is fine: `<export>/logs/<node>/laravel`, one node per directory, is what stage 3 offers (§1). Never point two nodes at the same one. |
 | `vendor/`, application code | Deployed per node. Loading PHP source over NFS is slow and defeats opcache. |
 
 ---
@@ -76,6 +94,19 @@ id nginx
 root on these paths. But it means the deploy process cannot `chown` files on the
 share as root — do that from a host with appropriate access, or set ownership at
 export creation.
+
+**If the per-node logs are used (§1), map the squashed root to the application user**
+rather than to `nobody`:
+
+```
+/govexy  web1(rw,sync,root_squash,anonuid=<uid of nginx>,anongid=<gid of nginx>) web2(...)
+```
+
+nginx and php-fpm open their log files as root. Squashed to `nobody`, that open is
+denied, and the service fails at its next restart — hours or days after the mount looked
+fine. Mapped to the application user, the open succeeds and the files land owned by the
+same user that owns everything else on the export. `03-mount-shared-storage.sh` probes a
+root write on both log directories and refuses to declare success without it.
 
 **NFS version.** NFSv4.1 or later. NFSv3 locking (`rpc.statd`/`lockd`) is fragile
 across a load-balanced pair.
@@ -102,6 +133,15 @@ nfs-server:/govexy       /srv/govexy-share                    nfs4  _netdev,hard
 /srv/govexy-share/media    /var/www/govexy/storage/app/public   none  bind,nofail,_netdev,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
 /srv/govexy-share/private  /var/www/govexy/storage/app/private  none  bind,nofail,_netdev,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
 /srv/govexy-share/themes   /var/www/govexy/resources/themes     none  bind,nofail,_netdev,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
+```
+
+With the optional per-node logs, on `web1` (and the same three lines with `web2` on the
+other node — never the same directory on both):
+
+```fstab
+/srv/govexy-share/logs/web1/laravel  /var/www/govexy/storage/logs  none  bind,nofail,_netdev,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
+/srv/govexy-share/logs/web1/nginx    /var/log/nginx                none  bind,nofail,_netdev,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
+/srv/govexy-share/logs/web1/php-fpm  /var/log/php-fpm              none  bind,nofail,_netdev,x-systemd.requires-mounts-for=/srv/govexy-share  0 0
 ```
 
 - **`x-systemd.requires-mounts-for`** is what stops a bind firing before the NFS export is
