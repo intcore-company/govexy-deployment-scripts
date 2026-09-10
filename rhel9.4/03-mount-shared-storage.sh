@@ -9,6 +9,19 @@
 #     <export>/<private>  ->  <APP_ROOT>/storage/app/private   form attachments
 #     <export>/<themes>   ->  <APP_ROOT>/resources/themes      uploaded themes
 #
+# Optionally (asked interactively) it also binds this node's logs onto a
+# PER-NODE directory of the same export, so every node's logs are readable
+# from one place without two nodes ever appending to one file:
+#
+#     <export>/<logs>/<node>/laravel  ->  <APP_ROOT>/storage/logs
+#     <export>/<logs>/<node>/nginx    ->  /var/log/nginx
+#     <export>/<logs>/<node>/php-fpm  ->  /var/log/php-fpm
+#
+# The nginx and php-fpm masters open their logs as ROOT. Under root_squash
+# that write is squashed, the open fails, and the service will not start —
+# so the export must map root to the application user (anonuid/anongid), and
+# step 7 probes exactly that before declaring success.
+#
 # Idempotent: safe to re-run. Existing fstab entries are detected, not duplicated.
 #
 # Usage:
@@ -164,16 +177,70 @@ SUB_MEDIA=$(ask   "Subdirectory for dashboard media"    "media")
 SUB_PRIVATE=$(ask "Subdirectory for form attachments"   "private")
 SUB_THEMES=$(ask  "Subdirectory for uploaded themes"    "themes")
 
-# source|target|label
+# source|target|label|writer|seed
+#
+#   writer  app   the application user writes here (probe as that user)
+#           root  a root-owned master process opens files here (nginx,
+#                 php-fpm) — probe as root too, because root_squash turns
+#                 that into a failed open and a service that will not start
+#   seed    yes   local content under the target is offered for copying
+#           no    logs: the local history stays on disk under the mount and
+#                 is not copied — it is not worth a partial-copy failure
 MAPPINGS=(
-  "${EXPORT_ROOT}/${SUB_MEDIA}|${APP_ROOT}/storage/app/public|dashboard media"
-  "${EXPORT_ROOT}/${SUB_PRIVATE}|${APP_ROOT}/storage/app/private|form attachments"
-  "${EXPORT_ROOT}/${SUB_THEMES}|${APP_ROOT}/resources/themes|uploaded themes"
+  "${EXPORT_ROOT}/${SUB_MEDIA}|${APP_ROOT}/storage/app/public|dashboard media|app|yes"
+  "${EXPORT_ROOT}/${SUB_PRIVATE}|${APP_ROOT}/storage/app/private|form attachments|app|yes"
+  "${EXPORT_ROOT}/${SUB_THEMES}|${APP_ROOT}/resources/themes|uploaded themes|app|yes"
 )
+
+# ── Per-node logs (optional) ────────────────────────────────────────────────
+#
+# One directory PER NODE. Two nodes appending to one file over NFS interleave
+# and corrupt entries (NFS-SHARED-STORAGE.md §2), so the share is a central
+# place to READ every node's logs, never a single file two nodes write.
+#
+# The node name defaults to NODE_HOSTNAME in govexy-node.conf, else the short
+# hostname. It must differ between the two nodes — a copied conf with the same
+# NODE_HOSTNAME on both would put both nodes into one directory, which is the
+# exact failure the per-node layout exists to prevent. Step 4 checks for that.
+NODE_NAME=""
+[[ -f "${SCRIPT_DIR}/govexy-node.conf" ]] && \
+  NODE_NAME=$(grep -E '^NODE_HOSTNAME=' "${SCRIPT_DIR}/govexy-node.conf" 2>/dev/null \
+    | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}') || true
+NODE_NAME="${NODE_NAME%%.*}"
+NODE_NAME="${NODE_NAME:-$(hostname -s)}"
+
+LOG_TARGETS=("${APP_ROOT}/storage/logs" /var/log/nginx /var/log/php-fpm)
+BIND_LOGS=false
+if $VERIFY_ONLY; then
+  # No prompt in verify mode: include the log binds if any of them is mounted.
+  for t in "${LOG_TARGETS[@]}"; do
+    findmnt -rn "$t" &>/dev/null && BIND_LOGS=true
+  done
+else
+  printf '\n'
+  if confirm "Also bind this node's logs (Laravel, nginx, php-fpm) to a per-node directory on the share?"; then
+    BIND_LOGS=true
+  fi
+fi
+
+SUB_LOGS="logs"
+if $BIND_LOGS; then
+  if ! $VERIFY_ONLY; then
+    SUB_LOGS=$(ask  "Subdirectory for per-node logs"        "logs")
+    NODE_NAME=$(ask "Name of THIS node (its log directory)" "$NODE_NAME")
+  fi
+  [[ "$NODE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "node name must be a plain directory name: '$NODE_NAME'"
+  LOG_ROOT="${EXPORT_ROOT}/${SUB_LOGS}/${NODE_NAME}"
+  MAPPINGS+=(
+    "${LOG_ROOT}/laravel|${APP_ROOT}/storage/logs|laravel logs, this node|app|no"
+    "${LOG_ROOT}/nginx|/var/log/nginx|nginx logs, this node|root|no"
+    "${LOG_ROOT}/php-fpm|/var/log/php-fpm|php-fpm logs, this node|root|no"
+  )
+fi
 
 printf '\n'
 for m in "${MAPPINGS[@]}"; do
-  IFS='|' read -r src tgt label <<< "$m"
+  IFS='|' read -r src tgt label writer seed <<< "$m"
   printf '  %-40s ->  %s   (%s)\n' "$src" "$tgt" "$label"
 done
 printf '\n'
@@ -182,7 +249,7 @@ if $VERIFY_ONLY; then
   log "VERIFY ONLY"
   rc=0
   for m in "${MAPPINGS[@]}"; do
-    IFS='|' read -r src tgt label <<< "$m"
+    IFS='|' read -r src tgt label writer seed <<< "$m"
     if findmnt -rn "$tgt" &>/dev/null; then
       ok "$tgt is mounted"
     else
@@ -209,8 +276,46 @@ log "4/7  Pre-flight — protect content that a bind mount would hide"
 # to 0 — the warning at the end could never fire.
 SEED_INCOMPLETE=0
 
+# The per-node log directory must be THIS node's. If the other node already
+# writes into it, its files carry that node's hostname in nothing but their
+# content — so the only cheap signal is a directory that exists, is not yet
+# mounted here, and is non-empty. Ask, do not guess.
+if $BIND_LOGS && [[ -d "$LOG_ROOT" ]] && ! findmnt -rn "${APP_ROOT}/storage/logs" &>/dev/null; then
+  if (( $(find "$LOG_ROOT" -mindepth 2 2>/dev/null | wc -l) > 0 )); then
+    printf '\n'
+    warn "${LOG_ROOT} already holds logs, and nothing on this node is mounted from it."
+    warn "If that is the OTHER node's directory, two nodes would write the same files."
+    printf '\nSibling directories under %s:\n' "${EXPORT_ROOT}/${SUB_LOGS}"
+    ls -1 "${EXPORT_ROOT}/${SUB_LOGS}" 2>/dev/null | sed 's/^/  /'
+    confirm "Is '${NODE_NAME}' really THIS node's name?" || die "aborted — re-run and give this node its own name"
+  fi
+fi
+
+# Creating directories ON the share: as the app user first. Under root_squash
+# root's mkdir is squashed and fails, while the app user owns the export root
+# (NFS-SHARED-STORAGE.md §6). Fall back to root for exports that allow it.
+# A directory that does not exist yet counts as empty. Under --dry-run nothing
+# is created, so `find <missing> | wc -l` failed, pipefail carried the failure
+# into the assignment, and errexit ended the dry run silently after the first
+# mapping — on exactly the fresh node a dry run is for.
+count_entries() {
+  [[ -d "$1" ]] || { printf '0'; return 0; }
+  find "$1" -mindepth 1 2>/dev/null | wc -l | tr -d ' '
+}
+
+mkdir_on_share() {
+  local dir=$1
+  if $DRY_RUN; then
+    run "sudo -u '$APP_USER' install -d '$dir' || install -d -o '$APP_USER' -g '$APP_GROUP' '$dir'"
+  else
+    sudo -u "$APP_USER" install -d "$dir" 2>/dev/null \
+      || install -d -o "$APP_USER" -g "$APP_GROUP" "$dir" \
+      || die "cannot create ${dir} — neither ${APP_USER} nor root may write there (export permissions / squash)"
+  fi
+}
+
 for m in "${MAPPINGS[@]}"; do
-  IFS='|' read -r src tgt label <<< "$m"
+  IFS='|' read -r src tgt label writer seed <<< "$m"
 
   if findmnt -rn "$tgt" &>/dev/null; then
     ok "already mounted, skipping checks: $tgt"
@@ -219,16 +324,30 @@ for m in "${MAPPINGS[@]}"; do
 
   if [[ ! -d "$src" ]]; then
     if confirm "Source ${src} does not exist. Create it?"; then
-      run "install -d -o '$APP_USER' -g '$APP_GROUP' '$src'"
+      mkdir_on_share "$src"
     else
       die "cannot bind a source that does not exist: $src"
     fi
   fi
 
-  run "install -d -o '$APP_USER' -g '$APP_GROUP' '$tgt'"
+  # Only CREATE a missing target. /var/log/nginx and /var/log/php-fpm exist
+  # root-owned from their packages; re-owning them to the app user would be a
+  # change under the mount that nobody asked for.
+  [[ -d "$tgt" ]] || run "install -d -o '$APP_USER' -g '$APP_GROUP' '$tgt'"
 
-  local_files=$(find "$tgt" -mindepth 1 2>/dev/null | wc -l)
-  share_files=$(find "$src" -mindepth 1 2>/dev/null | wc -l)
+  local_files=$(count_entries "$tgt")
+  share_files=$(count_entries "$src")
+
+  if [[ "$seed" == "no" ]]; then
+    # Logs. History is not copied: root-owned files under /var/log would make
+    # the app-user copy fail part way, and old local logs are not worth that.
+    # They stay on disk under the mount and reappear if it is unmounted.
+    if (( local_files > 0 )); then
+      warn "${tgt} holds ${local_files} entries of local log history; they stay on disk UNDER the mount, not copied."
+      warn "To read them later:  umount ${tgt}   (or look at the share for everything written after today)"
+    fi
+    continue
+  fi
 
   if (( local_files > 0 && share_files == 0 )); then
     printf '\n'
@@ -309,7 +428,7 @@ trap 'rm -f "$FSTAB_NEW"' EXIT
 } > "$FSTAB_NEW"
 
 for m in "${MAPPINGS[@]}"; do
-  IFS='|' read -r src tgt label <<< "$m"
+  IFS='|' read -r src tgt label writer seed <<< "$m"
 
   # By field, not by delimiter: a hand-written line mixing tabs and spaces
   # around the target defeated both fixed-string greps, and the duplicate bind
@@ -365,6 +484,31 @@ if command -v getsebool &>/dev/null && [[ "$(getenforce 2>/dev/null)" != "Disabl
   fi
 fi
 
+# A process that already had a log file open keeps writing to the LOCAL inode
+# under the new mount — the share shows an empty file while the log grows
+# invisibly on local disk. Make every writer reopen its logs once the binds
+# are in place: nginx and php-fpm reopen on reload, Horizon is long-lived and
+# holds laravel.log open, so terminate it and let its unit restart it. Only
+# when a log bind was actually added this run.
+if $BIND_LOGS && (( FSTAB_ADDED > 0 )); then
+  log "6b/7  Reopen log files"
+  if systemctl is-active --quiet nginx; then
+    run "nginx -t && systemctl reload nginx" \
+      && ok "nginx reloaded (logs reopened on the share)" \
+      || warn "nginx reload failed — it is still writing to the LOCAL files under the mount"
+  fi
+  if systemctl is-active --quiet php-fpm; then
+    run "systemctl reload php-fpm" \
+      && ok "php-fpm reloaded (logs reopened on the share)" \
+      || warn "php-fpm reload failed — it is still writing to the LOCAL files under the mount"
+  fi
+  if systemctl is-active --quiet govexy-horizon 2>/dev/null; then
+    run "sudo -u '$APP_USER' php '${APP_ROOT}/artisan' horizon:terminate" \
+      && ok "Horizon terminated; its unit restarts it with laravel.log on the share" \
+      || warn "horizon:terminate failed — restart govexy-horizon by hand or its log stays local"
+  fi
+fi
+
 # ═════════════════════════════════════════════════════════════════════════════
 log "7/7  Verify"
 # ═════════════════════════════════════════════════════════════════════════════
@@ -372,13 +516,30 @@ log "7/7  Verify"
 $DRY_RUN && { log "dry run complete — nothing changed"; exit 0; }
 
 FAILED=0
+ROOT_SQUASHED=0
 for m in "${MAPPINGS[@]}"; do
-  IFS='|' read -r src tgt label <<< "$m"
+  IFS='|' read -r src tgt label writer seed <<< "$m"
 
   if ! findmnt -rn "$tgt" &>/dev/null; then
     warn "NOT MOUNTED: $tgt"
     FAILED=1
     continue
+  fi
+
+  # nginx and php-fpm masters open their logs as root BEFORE dropping
+  # privileges. If the export squashes root to nobody, that open is denied and
+  # the service refuses to start on its next restart — a failure that appears
+  # hours later, at the first reboot, not now. Prove root can write here.
+  if [[ "$writer" == "root" ]]; then
+    rprobe=".rootprobe.$$"
+    if touch "${tgt}/${rprobe}" 2>/dev/null; then
+      rm -f "${tgt}/${rprobe}"
+    else
+      warn "ROOT cannot write to ${tgt} — nginx/php-fpm will fail to open their logs at the next restart"
+      ROOT_SQUASHED=1
+      FAILED=1
+      continue
+    fi
   fi
 
   # findmnt alone only proves something is mounted there. Write on the share and
@@ -407,12 +568,37 @@ for m in "${MAPPINGS[@]}"; do
 done
 
 printf '\n'
-findmnt -o TARGET,SOURCE,FSTYPE "${APP_ROOT}/storage/app/public" \
-                                "${APP_ROOT}/storage/app/private" \
-                                "${APP_ROOT}/resources/themes" 2>/dev/null || true
+ALL_TARGETS=()
+for m in "${MAPPINGS[@]}"; do
+  IFS='|' read -r src tgt label writer seed <<< "$m"
+  ALL_TARGETS+=("$tgt")
+done
+findmnt -o TARGET,SOURCE,FSTYPE "${ALL_TARGETS[@]}" 2>/dev/null || true
 
 (( SEED_INCOMPLETE == 0 )) || \
   warn "one or more shares were only PARTIALLY seeded — see the warnings above"
+
+if (( ROOT_SQUASHED )); then
+  cat >&2 <<SQUASH
+
+The export squashes root and the nginx / php-fpm log directories are not
+writable by the squashed identity. Two ways out — the first is the right one:
+
+  1. Ask the storage team to map root to the application user on this export,
+     keeping root_squash:
+         anonuid=$(id -u "$APP_USER"),anongid=$(id -g "$APP_GROUP")
+     (both web nodes report the same ids — NFS-SHARED-STORAGE.md §3)
+
+  2. Make the two log directories world-writable with the sticky bit, as the
+     application user, from any node:
+         sudo -u ${APP_USER} chmod 1777 ${LOG_ROOT}/nginx ${LOG_ROOT}/php-fpm
+
+Until one is done, do NOT restart nginx or php-fpm on this node. Roll back the
+log binds with:
+         umount /var/log/nginx /var/log/php-fpm ${APP_ROOT}/storage/logs
+         (and remove their lines from /etc/fstab)
+SQUASH
+fi
 
 (( FAILED == 0 )) || die "verification failed — see warnings above"
 
@@ -432,7 +618,27 @@ Cross-node check, once a second node is done:
     ls -la ${APP_ROOT}/storage/app/public/.crosstest
     # node A
     rm -f ${APP_ROOT}/storage/app/public/.crosstest
+DONE
 
+if $BIND_LOGS; then
+cat <<LOGS
+Per-node logs: every node's logs are under ${EXPORT_ROOT}/${SUB_LOGS}/<node>/.
+Give the OTHER node a different name when you run this there. Read across nodes:
+
+    tail -f ${EXPORT_ROOT}/${SUB_LOGS}/*/laravel/laravel.log
+    ls ${EXPORT_ROOT}/${SUB_LOGS}/
+
+logrotate for nginx creates the rotated file as nginx:adm. With root mapped to
+the application user on the export, the chgrp to adm is refused and the daily
+rotation fails. If ${EXPORT_ROOT} squashes root, change the create line:
+
+    sed -i 's/^\(\s*create 640 nginx\) adm/\1 ${APP_GROUP}/' /etc/logrotate.d/nginx
+    logrotate -d /etc/logrotate.d/nginx      # dry run, expect no errors
+
+LOGS
+fi
+
+cat <<DONE
 One thing this script cannot fix, in the application repository:
 
   resources/themes is tracked in git. While it stays tracked, every deploy that

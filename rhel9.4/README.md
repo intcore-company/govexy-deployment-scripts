@@ -29,7 +29,7 @@ them away.
 | `govexy-node.conf` | The live configuration. **Git-ignored, never committed** — it carries the estate's addresses and this repository is public. Sourced or read by every script. **Edit here, never inside the scripts.** |
 | `01-install-dependencies.sh` | Stage 1 — install only. Repos, packages, PHP 8.4, Composer. Starts no services. No prompts. |
 | `02-configure-nginx-php.sh` | Stage 2 — configuration. FPM pool, php.ini, nginx vhost, SELinux, firewalld; starts and verifies services. Also `--set-lb` mode. **Prompts for confirmation.** |
-| `03-mount-shared-storage.sh` | Stage 3 — bind the three shared paths out of the NFS export onto the application. Interactive; `--dry-run` and `--verify` modes. |
+| `03-mount-shared-storage.sh` | Stage 3 — bind the three shared paths out of the NFS export onto the application, and optionally this node's logs onto a per-node directory of the same export. Interactive; `--dry-run` and `--verify` modes. |
 | `04-deploy.sh` | Stage 4 — **per release, on every node.** Pulls a tag, builds, runs the Pest gate, migrates on the primary, rebuilds caches, reloads FPM. **Prompts for confirmation.** |
 | `05-configure-workers.sh` | Stage 5 — scheduler cron (primary only), Horizon unit, meter-ingest timer. `--status` and `--remove` modes. **Prompts for confirmation.** |
 | `nfs-latency-check.sh` | Diagnostic. Measures NFS stat latency against local disk for the paths Blade actually reads. Writes a 64 MB probe into the media export and removes it. |
@@ -278,6 +278,35 @@ bash 03-mount-shared-storage.sh             # do it
 bash 03-mount-shared-storage.sh --verify    # check an existing setup
 ```
 
+**Per-node logs (optional).** The script asks whether to also bind this node's logs onto
+the share, so both nodes' logs are readable from one place:
+
+| On this node | On the share |
+|---|---|
+| `storage/logs` | `<export>/logs/<node>/laravel` |
+| `/var/log/nginx` | `<export>/logs/<node>/nginx` |
+| `/var/log/php-fpm` | `<export>/logs/<node>/php-fpm` |
+
+`<node>` defaults to `NODE_HOSTNAME` from `govexy-node.conf` (short form), else the short
+hostname. **It must differ between the two nodes**: two nodes appending to one file over
+NFS interleave and corrupt lines, which is why the layout is per node and never one shared
+file. The script refuses a directory that already holds another node's logs unless you
+confirm the name.
+
+Two things to know before saying yes:
+
+- **nginx and php-fpm open their logs as root.** If the export squashes root to `nobody`,
+  the open fails and the service does not start at its next restart. The script probes a
+  root write on both directories and stops with instructions if it fails. The fix is on the
+  export: `anonuid=<uid of nginx>,anongid=<gid of nginx>` alongside `root_squash`
+  (NFS-SHARED-STORAGE.md §3). The fallback is `chmod 1777` on those two directories.
+- **Local log history is not copied.** It stays on disk under the mount and is readable
+  after `umount`. Everything written after the run lands on the share. The script reloads
+  nginx and php-fpm and terminates Horizon so every writer reopens its files there.
+
+The meter log `/var/log/govexy-meter` stays local on purpose: stage 5 drains it per node
+with a per-node cursor.
+
 ### Stage 4 — deploy a release
 
 Per release, on every node, **primary first**.
@@ -365,7 +394,12 @@ grep -E '^(APP_ENV|APP_DEBUG|TELESCOPE_ENABLED|LICENSE_MODE)=' /var/www/govexy/.
 | `TELESCOPE_ENABLED` | `false` | **Most likely to be missing.** `config/telescope.php` defaults it to `true`, and `laravel/telescope` is in `require`, so `--no-dev` leaves it installed. The UI is gated but the *recording* is not: every request, query, job and payload is written to `telescope_entries`, unbounded, on government data. It is absent from older `.env` files, so add it. |
 | `LICENSE_MODE` | present (`onprem`) | `onprem` and `saas` are different products. |
 
-Five other changes affect an existing estate:
+Six other changes affect an existing estate:
+
+- **Stage 3 can bind logs to the share.** Opt-in, per node, off by default. An estate that
+  is already mounted can re-run `03-mount-shared-storage.sh` and answer yes; the three
+  existing binds are detected and left alone. Read the per-node logs section under Stage 3
+  first, in particular the root-squash requirement on the export.
 
 - **`govexy-node.conf` is no longer tracked.** The repository ships
   `govexy-node.conf.example`; a node that pulls this version keeps its existing
