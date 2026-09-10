@@ -92,8 +92,21 @@ Stages 1 and 2 refuse to run until it exists:
 cp govexy-node.conf.example govexy-node.conf
 ```
 
-A node that already has a `govexy-node.conf` keeps it across `git pull`; diff it against
-the example after pulling to pick up new keys.
+**Upgrading a node that was set up before v1.1.0** — its `govexy-node.conf` was a
+*tracked* file then, so `git pull` does not leave it alone: unmodified, git renames it to
+the example and the conf is gone; modified, git refuses to pull at all. Back it up first,
+pull, put it back:
+
+```bash
+cd /root/govexy-deployment-scripts/rhel9.4
+cp govexy-node.conf /root/govexy-node.conf.bak
+git checkout -- govexy-node.conf          # drop the local edits so the pull can apply
+git pull
+cp /root/govexy-node.conf.bak govexy-node.conf
+diff govexy-node.conf govexy-node.conf.example   # pick up new keys
+```
+
+From then on the file is git-ignored and every later `git pull` leaves it alone.
 
 Every variable is listed. Stages 1 and 2 `source` this file, so a syntax error here
 breaks both; stages 3, 4 and 5 read individual keys out of it with `grep`.
@@ -307,6 +320,34 @@ Two things to know before saying yes:
 The meter log `/var/log/govexy-meter` stays local on purpose: stage 5 drains it per node
 with a per-node cursor.
 
+**Moving to a different NFS export.** Re-running the script does **not** migrate: the
+export root is discovered from what is mounted, an fstab entry that already exists for a
+target is kept as-is, and a target that is already mounted is skipped. Step 7 will report
+`MISMATCH` against the new export, but nothing is changed. Migrate by hand, then re-run:
+
+```bash
+# 1. stop the writers
+systemctl stop nginx php-fpm govexy-horizon
+
+# 2. drop the old binds and their fstab lines
+umount /var/www/govexy/storage/app/public /var/www/govexy/storage/app/private \
+       /var/www/govexy/resources/themes
+# plus the three log binds if they were set up:
+#   umount /var/www/govexy/storage/logs /var/log/nginx /var/log/php-fpm
+cp -a /etc/fstab /etc/fstab.bak.$(date +%s)
+sed -i -e '/^# GovExy shared storage/,/^#     findmnt /d' \
+       -e '/x-systemd.requires-mounts-for=/d' /etc/fstab     # the block the script wrote
+# (check with: grep -n govexy /etc/fstab — nothing should remain)
+
+# 3. the storage team swaps the NFS mount itself (old export out, new export in)
+
+# 4. seed the new export from the old one once, from one node, as the app user,
+#    or have the storage team copy it — then re-run stage 3 on every node
+bash 03-mount-shared-storage.sh --dry-run
+bash 03-mount-shared-storage.sh
+systemctl start php-fpm nginx govexy-horizon
+```
+
 ### Stage 4 — deploy a release
 
 Per release, on every node, **primary first**.
@@ -402,9 +443,13 @@ Six other changes affect an existing estate:
   first, in particular the root-squash requirement on the export.
 
 - **`govexy-node.conf` is no longer tracked.** The repository ships
-  `govexy-node.conf.example`; a node that pulls this version keeps its existing
-  `govexy-node.conf` untouched (it is git-ignored), and a fresh clone must copy the example
-  before stage 1 or 2 will run.
+  `govexy-node.conf.example`. On a node set up before v1.1.0 the conf was tracked, so the
+  first `git pull` removes it (or refuses to run over local edits) — back it up and restore
+  it as shown in §3. Without it stages 1 and 2 refuse to run, and stages 3, 4 and 5 fall
+  back silently to defaults: `APP_ROOT=/var/www/govexy`, `NODE_ROLE=secondary`, tests on.
+- **A changed NFS export is not picked up by re-running stage 3.** The export root is
+  discovered from what is mounted, not read from the conf, and an existing fstab entry for
+  a target is kept as-is, not rewritten. Follow the migration steps under Stage 3.
 
 - **`PHP_POST_MAX`** is new in `govexy-node.conf`. A conf written before it existed still
   works — stage 2 derives `PHP_UPLOAD_MAX + 8M` — but set it explicitly if you want a
