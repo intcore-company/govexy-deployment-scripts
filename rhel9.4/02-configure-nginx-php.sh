@@ -782,6 +782,22 @@ fi
 log "5/6  Firewall"
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Stage 1 enables firewalld, but a node where it was stopped since (or that
+# skipped stage 1) reached here and died on the first firewall-cmd with nothing
+# but "FirewallD is not running" — before step 6, so the pool and vhost just
+# written were never reloaded. With RESTRICT_HTTP_TO_LB=yes the restriction
+# cannot exist without firewalld, so it is started; the default public zone
+# keeps ssh open and nothing this node needs is inbound apart from :80.
+if ! systemctl is-active --quiet firewalld; then
+  warn "firewalld is not running. RESTRICT_HTTP_TO_LB=${RESTRICT_HTTP_TO_LB} needs it to hold any rule at all."
+  read -r -p "Start and enable firewalld now? [y/N] " fwconfirm \
+    || die "no terminal to confirm on (non-interactive run). Run it under tmux."
+  [[ "$fwconfirm" == [yY] ]] || die "firewalld is required for the firewall step. Start it and re-run:
+       systemctl enable --now firewalld"
+  systemctl enable --now firewalld
+  firewall-cmd --state
+fi
+
 if [[ "$RESTRICT_HTTP_TO_LB" == "yes" ]]; then
   firewall-cmd --permanent --remove-service=http  &>/dev/null || true
   firewall-cmd --permanent --remove-service=https &>/dev/null || true
