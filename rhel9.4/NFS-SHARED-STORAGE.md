@@ -126,7 +126,9 @@ and monitor accordingly.
 
 This is the supported arrangement and the one `03-mount-shared-storage.sh` builds. The
 storage team mounts **one** export; the script binds three of its subdirectories onto the
-application paths:
+application paths. Record the mount point as `NFS_EXPORT_ROOT` in `govexy-node.conf` so
+the script needs no discovery, and change it there when the export moves — a re-run then
+replaces the stale binds.
 
 ```fstab
 nfs-server:/govexy       /srv/govexy-share                    nfs4  _netdev,hard,timeo=600,retrans=2,noatime,nodiratime  0 0

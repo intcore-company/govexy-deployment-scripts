@@ -44,6 +44,29 @@ LB_IPS=""                              # space separated if the LB is clustered
 # ── Application ──────────────────────────────────────────────────────────────
 APP_ROOT="/var/www/govexy"             # Laravel root; public/ lives under this
 
+# ── Shared storage (stage 3) ─────────────────────────────────────────────────
+#
+# Where the storage team mounted the NFS export on THIS node (the mount point,
+# not the server path): the TARGET column of `findmnt -t nfs,nfs4`. With it set,
+# 03-mount-shared-storage.sh asks nothing about discovery and every other
+# answer defaults to the values below — a complete conf is re-run by pressing
+# Enter. Empty = discover the mounted exports and ask.
+#
+# When the export MOVES, change this and re-run stage 3: binds still pointing at
+# the old export are unmounted, their fstab lines rewritten, and rebound here.
+NFS_EXPORT_ROOT=""                     # e.g. "/govexy"
+NFS_SUB_MEDIA="media"                  # <export>/media    -> storage/app/public
+NFS_SUB_PRIVATE="private"              # <export>/private  -> storage/app/private
+NFS_SUB_THEMES="themes"                # <export>/themes   -> resources/themes
+
+# Per-node logs on the share: "yes" | "no" | empty (= ask).
+# <export>/<NFS_SUB_LOGS>/<NODE_HOSTNAME short>/{laravel,nginx,php-fpm}. One
+# directory PER NODE — NODE_HOSTNAME must differ between the nodes. The export
+# must map squashed root to the application user (anonuid/anongid), see
+# NFS-SHARED-STORAGE.md §3, or nginx and php-fpm cannot open their logs.
+NFS_BIND_LOGS=""
+NFS_SUB_LOGS="logs"
+
 # ── Install options ──────────────────────────────────────────────────────────
 INSTALL_IMAGICK="yes"                  # PDF thumbnails + better image conversions
 
