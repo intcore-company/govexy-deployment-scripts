@@ -1,7 +1,15 @@
-# GovExy web node — shared configuration
+# GovExy web node — shared configuration TEMPLATE
 #
-# Sourced by both 01-install-dependencies.sh and 02-configure-nginx-php.sh.
-# Keep this file beside the scripts. Edit here, not inside the scripts.
+# This file is tracked; the live copy is not. On each node:
+#
+#   cp govexy-node.conf.example govexy-node.conf
+#   vim govexy-node.conf
+#
+# govexy-node.conf is git-ignored because it carries the estate's addresses
+# (Redis, load balancer) and per-node identity, and this repository is public.
+# Sourced by 01-install-dependencies.sh and 02-configure-nginx-php.sh; the other
+# stages grep individual keys out of it. Keep it beside the scripts. Edit the
+# copy, not the scripts, and not this template.
 
 # ── Identity / locale ────────────────────────────────────────────────────────
 SERVER_TZ="Asia/Dubai"
@@ -23,7 +31,7 @@ NODE_HOSTNAME=""                       # e.g. "web1.govexy.local"; empty = leave
 NODE_ROLE="secondary"
 
 # ── Backing services ─────────────────────────────────────────────────────────
-REDIS_HOST="10.32.46.95"               # redis server IP
+REDIS_HOST=""                          # redis server IP — REQUIRED, stage 2 refuses without it
 
 # Load balancer — OPTIONAL, leave empty until it exists.
 # Do NOT guess. This becomes nginx's set_real_ip_from allowlist: it decides whose
@@ -31,7 +39,7 @@ REDIS_HOST="10.32.46.95"               # redis server IP
 # to trust a forged header from whoever actually occupies that address, which
 # defeats rate limiting and poisons audit logs. Empty = directive omitted (safe).
 # Add later:  bash 02-configure-nginx-php.sh --set-lb <ip> [<ip>...]
-LB_IPS="10.33.80.218"                              # space separated if the LB is clustered
+LB_IPS=""                              # space separated if the LB is clustered
 
 # ── Application ──────────────────────────────────────────────────────────────
 APP_ROOT="/var/www/govexy"             # Laravel root; public/ lives under this
